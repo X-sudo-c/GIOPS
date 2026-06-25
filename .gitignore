@@ -34,6 +34,10 @@ supabase/.temp/
 supabase/Power System.gpkg
 *.gpkg
 
+# --- Generated map tile archives (build locally; not for git) ---
+*.pmtiles
+backoffice-ui/cloudhound frontend portal/public/tiles/
+
 # --- IDE / OS ---
 .DS_Store
 Thumbs.db
