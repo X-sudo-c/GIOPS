@@ -1,0 +1,111 @@
+import { useCallback, useMemo } from 'react';
+import { GiopMapView } from './GiopMapView';
+import { GiopTopologyTab } from './GiopTopologyTab';
+import { SPLIT_VIEW_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
+import type { PortalGraphResponse } from '../lib/giopGraphTypes';
+import type { GiopStagingAsset } from '../api/giop-api';
+import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
+import { chunkToPortalGraph } from '../lib/giopGraphAdapter';
+import type { MapBbox } from '../hooks/useGiopGraphChunk';
+
+interface GiopSplitViewProps {
+  graph: PortalGraphResponse | null;
+  loading: boolean;
+  error: string | null;
+  graphQuery: GiopGraphQueryKey;
+  onQueryChange: (key: GiopGraphQueryKey) => void;
+  isLightMode: boolean;
+  focusMrid?: string | null;
+  onFocusHandled?: () => void;
+  onGraphNodeSelect?: (mrid: string, label?: string) => void;
+  focusCoordinates?: [number, number] | null;
+  stagingAssets?: GiopStagingAsset[];
+  onMapNodeClick?: (mrid: string, coordinates?: [number, number]) => void;
+  mapRefreshToken?: number;
+  startMrid?: string;
+}
+
+const SPLIT_RATIO_KEY = 'giop.portal.splitRatio.v1';
+
+function readSplitRatio(): number {
+  try {
+    const raw = localStorage.getItem(SPLIT_RATIO_KEY);
+    const n = raw ? Number(raw) : 50;
+    return Number.isFinite(n) ? Math.min(80, Math.max(20, n)) : 50;
+  } catch {
+    return 50;
+  }
+}
+
+export function GiopSplitView({
+  graph,
+  loading,
+  error,
+  graphQuery,
+  onQueryChange,
+  isLightMode,
+  focusMrid,
+  onFocusHandled,
+  onGraphNodeSelect,
+  focusCoordinates,
+  stagingAssets = [],
+  onMapNodeClick,
+  mapRefreshToken = 0,
+  startMrid,
+}: GiopSplitViewProps) {
+  const ratio = readSplitRatio();
+  const { chunk, loading: chunkLoading, error: chunkError, loadBbox } = useGiopGraphChunk(startMrid);
+
+  const viewportGraph = useMemo(
+    () => (chunk ? chunkToPortalGraph(chunk, stagingAssets) : null),
+    [chunk, stagingAssets],
+  );
+
+  const displayGraph = graphQuery === 'viewport_subgraph' ? viewportGraph : graph;
+  const displayLoading = graphQuery === 'viewport_subgraph' ? chunkLoading && !viewportGraph : loading;
+  const displayError =
+    graphQuery === 'viewport_subgraph' ? chunkError || (viewportGraph ? null : error) : error;
+
+  const handleViewportChange = useCallback(
+    (bbox: MapBbox, zoom: number) => {
+      void loadBbox(bbox, zoom);
+    },
+    [loadBbox],
+  );
+
+  return (
+    <div className="flex h-full min-h-0">
+      <div className="min-h-0 h-full border-r border-slate-800" style={{ width: `${ratio}%` }}>
+        <GiopMapView
+          isLightMode={isLightMode}
+          focusMrid={focusMrid}
+          focusCoordinates={focusCoordinates}
+          stagingAssets={stagingAssets}
+          onNodeClick={onMapNodeClick}
+          onViewportChange={handleViewportChange}
+          refreshToken={mapRefreshToken}
+          startMrid={startMrid}
+          streamGraphChunk={false}
+          graphChunk={chunk}
+          chunkLoadingExternal={chunkLoading}
+          chunkErrorExternal={chunkError}
+        />
+      </div>
+      <div className="min-h-0 flex-1">
+        <GiopTopologyTab
+          graph={displayGraph}
+          loading={displayLoading}
+          error={displayError}
+          graphQuery={graphQuery}
+          onQueryChange={onQueryChange}
+          isLightMode={isLightMode}
+          focusMrid={focusMrid}
+          onFocusHandled={onFocusHandled}
+          onNodeSelect={onGraphNodeSelect}
+          graphQueryOptions={SPLIT_VIEW_GRAPH_QUERY_OPTIONS}
+          compact
+        />
+      </div>
+    </div>
+  );
+}

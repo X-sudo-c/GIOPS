@@ -1,0 +1,88 @@
+import type { GiopGraphChunkResponse } from '../api/giop-api';
+import { voltageEdgeColor } from './giopSldTheme';
+
+export function chunkToEdgeGeoJson(chunk: GiopGraphChunkResponse | null) {
+  if (!chunk) {
+    return { type: 'FeatureCollection' as const, features: [] };
+  }
+
+  const coordsByMrid = new Map(
+    chunk.nodes.map((node) => [node.mrid, [node.lon, node.lat] as [number, number]]),
+  );
+
+  const features = chunk.edges
+    .map((edge) => {
+      const source =
+        coordsByMrid.get(edge.source) ??
+        (edge.source_lon != null && edge.source_lat != null
+          ? ([edge.source_lon, edge.source_lat] as [number, number])
+          : undefined);
+      const target =
+        coordsByMrid.get(edge.target) ??
+        (edge.target_lon != null && edge.target_lat != null
+          ? ([edge.target_lon, edge.target_lat] as [number, number])
+          : undefined);
+      if (!source || !target) return null;
+      return {
+        type: 'Feature' as const,
+        properties: {
+          mrid: edge.mrid,
+          source: edge.source,
+          target: edge.target,
+          voltage: edge.voltage,
+          color: voltageEdgeColor(edge.voltage),
+        },
+        geometry: {
+          type: 'LineString' as const,
+          coordinates: [source, target],
+        },
+      };
+    })
+    .filter((feature): feature is NonNullable<typeof feature> => feature !== null);
+
+  return { type: 'FeatureCollection' as const, features };
+}
+
+export function chunkToTracedNodeGeoJson(chunk: GiopGraphChunkResponse | null) {
+  if (!chunk) {
+    return { type: 'FeatureCollection' as const, features: [] };
+  }
+
+  return {
+    type: 'FeatureCollection' as const,
+    features: chunk.nodes
+      .filter((node) => node.traced)
+      .map((node) => ({
+        type: 'Feature' as const,
+        properties: { mrid: node.mrid, name: node.name },
+        geometry: {
+          type: 'Point' as const,
+          coordinates: [node.lon, node.lat] as [number, number],
+        },
+      })),
+  };
+}
+
+/** All nodes in the viewport chunk — used when Martin tiles are unavailable. */
+export function chunkToNodeGeoJson(chunk: GiopGraphChunkResponse | null) {
+  if (!chunk) {
+    return { type: 'FeatureCollection' as const, features: [] };
+  }
+
+  return {
+    type: 'FeatureCollection' as const,
+    features: chunk.nodes.map((node) => ({
+      type: 'Feature' as const,
+      properties: {
+        mrid: node.mrid,
+        name: node.name,
+        connected: node.connected,
+        traced: node.traced,
+      },
+      geometry: {
+        type: 'Point' as const,
+        coordinates: [node.lon, node.lat] as [number, number],
+      },
+    })),
+  };
+}

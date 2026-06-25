@@ -1,0 +1,684 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+  min-height: 100vh;
+}
+
+/* MapLibre needs an explicit sized parent */
+.giop-map-host {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 300px;
+}
+
+.giop-map-host .maplibregl-map,
+.giop-map-host .maplibregl-canvas-container {
+  width: 100%;
+  height: 100%;
+}
+
+.starfield-layer,
+.starfield-layer-soft {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.starfield-layer::before,
+.starfield-layer-soft::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-repeat: repeat;
+  animation: star-drift 140s linear infinite;
+}
+
+.starfield-layer::before {
+  opacity: 0.35;
+  background-image:
+    radial-gradient(2px 2px at 18% 22%, rgba(255, 255, 255, 0.9) 50%, transparent 52%),
+    radial-gradient(2px 2px at 73% 31%, rgba(255, 255, 255, 0.85) 50%, transparent 52%),
+    radial-gradient(1.5px 1.5px at 41% 68%, rgba(255, 255, 255, 0.9) 50%, transparent 52%),
+    radial-gradient(1.5px 1.5px at 87% 74%, rgba(255, 255, 255, 0.8) 50%, transparent 52%),
+    radial-gradient(1px 1px at 11% 79%, rgba(255, 255, 255, 0.85) 50%, transparent 52%),
+    radial-gradient(1px 1px at 62% 12%, rgba(255, 255, 255, 0.8) 50%, transparent 52%);
+  background-size: 640px 420px;
+}
+
+.starfield-layer-soft::before {
+  opacity: 0.2;
+  filter: blur(0.3px);
+  animation-duration: 220s;
+  background-image:
+    radial-gradient(1px 1px at 28% 18%, rgba(148, 163, 184, 0.7) 50%, transparent 52%),
+    radial-gradient(1px 1px at 56% 42%, rgba(148, 163, 184, 0.65) 50%, transparent 52%),
+    radial-gradient(1px 1px at 82% 61%, rgba(148, 163, 184, 0.65) 50%, transparent 52%),
+    radial-gradient(1px 1px at 34% 88%, rgba(148, 163, 184, 0.7) 50%, transparent 52%),
+    radial-gradient(1px 1px at 7% 47%, rgba(148, 163, 184, 0.65) 50%, transparent 52%),
+    radial-gradient(1px 1px at 91% 23%, rgba(148, 163, 184, 0.65) 50%, transparent 52%);
+  background-size: 780px 540px;
+}
+
+.shooting-star {
+  position: absolute;
+  width: 220px;
+  height: 1.5px;
+  opacity: 0;
+  transform: rotate(-28deg) translateX(0);
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.95), rgba(148, 163, 184, 0));
+  filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.45));
+  animation: shooting-star var(--star-duration, 10s) linear infinite;
+  animation-delay: var(--star-delay, 0s);
+  transition: opacity 900ms ease, background 900ms ease, filter 900ms ease;
+}
+
+.asteroid-body,
+.asteroid-tail,
+.impact-burst,
+.impact-ring,
+.impact-flash,
+.cooling-wave,
+.cooling-ring,
+.cooling-fade {
+  position: absolute;
+  pointer-events: none;
+}
+
+.asteroid-body {
+  top: -14%;
+  left: -18%;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: radial-gradient(circle at 30% 30%, #fff7d6, #f59e0b 62%, #7c2d12);
+  box-shadow: 0 0 34px rgba(245, 158, 11, 0.95), 0 0 60px rgba(251, 191, 36, 0.55);
+  opacity: 0;
+  transform: rotate(-24deg) translateX(0) translateY(0);
+}
+
+.asteroid-tail {
+  top: -13.5%;
+  left: -19%;
+  width: 420px;
+  height: 3px;
+  opacity: 0;
+  transform: rotate(-24deg) translateX(0);
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 231, 178, 0.95), rgba(245, 158, 11, 0.98), rgba(245, 158, 11, 0));
+  filter: blur(0.6px) drop-shadow(0 0 8px rgba(245, 158, 11, 0.6));
+}
+
+.impact-burst,
+.impact-ring {
+  top: 66%;
+  left: 58%;
+  transform: translate(-50%, -50%) scale(0.2);
+  opacity: 0;
+}
+
+.impact-burst {
+  width: 84px;
+  height: 84px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(255, 255, 255, 1) 0%, rgba(253, 224, 71, 0.98) 26%, rgba(251, 146, 60, 0.82) 52%, rgba(251, 146, 60, 0) 78%);
+}
+
+.impact-ring {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 3px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 26px rgba(255, 255, 255, 0.45);
+}
+
+.impact-flash {
+  inset: 0;
+  opacity: 0;
+  background:
+    radial-gradient(circle at 58% 66%, rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.18) 34%, rgba(255, 255, 255, 0) 70%),
+    radial-gradient(circle at 58% 66%, rgba(251, 146, 60, 0.35), rgba(251, 146, 60, 0) 62%);
+}
+
+.cooling-wave,
+.cooling-ring {
+  top: 66%;
+  left: 58%;
+  transform: translate(-50%, -50%) scale(0.2);
+  opacity: 0;
+}
+
+.cooling-wave {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(226, 232, 240, 0.8) 0%, rgba(125, 211, 252, 0.45) 34%, rgba(125, 211, 252, 0) 70%);
+}
+
+.cooling-ring {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 2px solid rgba(226, 232, 240, 0.75);
+}
+
+.cooling-fade {
+  inset: 0;
+  opacity: 0;
+  background: radial-gradient(circle at 58% 66%, rgba(125, 211, 252, 0.18), rgba(15, 23, 42, 0.08) 38%, rgba(0, 0, 0, 0) 72%);
+}
+
+.brightness-pulse {
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(circle at 58% 66%, rgba(255, 255, 255, 0.9) 0%, rgba(255, 250, 205, 0.75) 12%, rgba(255, 229, 109, 0.55) 26%, rgba(251, 146, 60, 0.32) 42%, rgba(251, 146, 60, 0) 68%);
+  mix-blend-mode: screen;
+}
+
+.brightness-pulse.brightness-active {
+  animation: brightness-pulse 2.2s ease-out forwards;
+}
+
+.asteroid-body.asteroid-active {
+  animation: asteroid-impact 1.45s ease-in forwards;
+}
+
+.asteroid-tail.asteroid-active {
+  animation: asteroid-tail 1.45s ease-in forwards;
+}
+
+.impact-burst.impact-active {
+  animation: impact-burst 1s ease-out forwards;
+}
+
+.impact-ring.impact-active {
+  animation: impact-ring 1.2s ease-out forwards;
+}
+
+.impact-flash.impact-active {
+  animation: impact-flash 2.1s ease-out forwards;
+}
+
+.login-scene::after {
+  content: '';
+  position: absolute;
+  inset: -12%;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(circle at 58% 66%, rgba(255, 245, 200, 0.28), rgba(255, 245, 200, 0) 44%),
+    radial-gradient(circle at 40% 40%, rgba(251, 146, 60, 0.12), rgba(251, 146, 60, 0) 52%);
+  mix-blend-mode: screen;
+}
+
+.login-scene.impact-sequence::after {
+  animation: blast-overlay 2.2s ease-out forwards;
+}
+
+.login-scene.impact-sequence .login-panel {
+  animation: scene-shake 1.05s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  will-change: transform;
+}
+
+.cooling-wave.cooling-active {
+  animation: cooling-wave 1.15s ease-out forwards;
+}
+
+.cooling-ring.cooling-active {
+  animation: cooling-ring 1.15s ease-out forwards;
+}
+
+.cooling-fade.cooling-active {
+  animation: cooling-fade 1.15s ease-out forwards;
+}
+
+@keyframes star-drift {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(-140px, 60px, 0);
+  }
+}
+
+@keyframes shooting-star {
+  0%,
+  70%,
+  100% {
+    opacity: 0;
+    transform: rotate(-28deg) translateX(0);
+  }
+  72% {
+    opacity: 0.9;
+  }
+  85% {
+    opacity: 0.7;
+    transform: rotate(-28deg) translateX(520px);
+  }
+  92% {
+    opacity: 0;
+    transform: rotate(-28deg) translateX(620px);
+  }
+}
+
+@keyframes asteroid-impact {
+  0% {
+    opacity: 0;
+    transform: rotate(-24deg) translateX(0) translateY(0);
+  }
+  3% {
+    opacity: 1;
+  }
+  72% {
+    opacity: 1;
+    transform: rotate(-24deg) translateX(1120px) translateY(770px);
+  }
+  100% {
+    opacity: 0;
+    transform: rotate(-24deg) translateX(1200px) translateY(850px);
+  }
+}
+
+@keyframes asteroid-tail {
+  0% {
+    opacity: 0;
+    transform: rotate(-24deg) translateX(0);
+  }
+  5% {
+    opacity: 0.9;
+  }
+  74% {
+    opacity: 0.68;
+    transform: rotate(-24deg) translateX(1120px);
+  }
+  100% {
+    opacity: 0;
+    transform: rotate(-24deg) translateX(1200px);
+  }
+}
+
+@keyframes impact-burst {
+  0%,
+  60% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.2);
+  }
+  68% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(0.8);
+  }
+  78% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(2.4);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(7.8);
+  }
+}
+
+@keyframes impact-ring {
+  0%,
+  62% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.2);
+  }
+  70% {
+    opacity: 0.95;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  80% {
+    opacity: 0.8;
+    transform: translate(-50%, -50%) scale(4.6);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(14);
+  }
+}
+
+@keyframes impact-flash {
+  0%,
+  60% {
+    opacity: 0;
+  }
+  66% {
+    opacity: 1;
+  }
+  72% {
+    opacity: 0.55;
+  }
+  78% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 0.25;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes blast-overlay {
+  0%,
+  58% {
+    opacity: 0;
+  }
+  68% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 0.45;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes scene-shake {
+  0%,
+  58% {
+    transform: translate3d(0, 0, 0);
+  }
+  59% {
+    transform: translate3d(-2px, 0.5px, 0);
+  }
+  60% {
+    transform: translate3d(3.2px, -0.8px, 0);
+  }
+  61% {
+    transform: translate3d(-3.8px, 1px, 0);
+  }
+  62% {
+    transform: translate3d(4.2px, -1.2px, 0);
+  }
+  63% {
+    transform: translate3d(-4.5px, 1.1px, 0);
+  }
+  64% {
+    transform: translate3d(5px, -1.4px, 0);
+  }
+  65% {
+    transform: translate3d(-5.2px, 1.3px, 0);
+  }
+  66% {
+    transform: translate3d(5.5px, -1.5px, 0);
+  }
+  67% {
+    transform: translate3d(-5.8px, 1.6px, 0);
+  }
+  68% {
+    transform: translate3d(6px, -1.7px, 0);
+  }
+  69% {
+    transform: translate3d(-6.2px, 1.8px, 0);
+  }
+  70% {
+    transform: translate3d(6.4px, -1.9px, 0);
+  }
+  71% {
+    transform: translate3d(-6.3px, 1.85px, 0);
+  }
+  72% {
+    transform: translate3d(6.1px, -1.8px, 0);
+  }
+  73% {
+    transform: translate3d(-5.9px, 1.7px, 0);
+  }
+  74% {
+    transform: translate3d(5.7px, -1.65px, 0);
+  }
+  75% {
+    transform: translate3d(-5.5px, 1.6px, 0);
+  }
+  76% {
+    transform: translate3d(5.2px, -1.5px, 0);
+  }
+  77% {
+    transform: translate3d(-4.8px, 1.4px, 0);
+  }
+  78% {
+    transform: translate3d(4.4px, -1.3px, 0);
+  }
+  79% {
+    transform: translate3d(-4px, 1.2px, 0);
+  }
+  80% {
+    transform: translate3d(3.5px, -1px, 0);
+  }
+  82% {
+    transform: translate3d(-2.8px, 0.8px, 0);
+  }
+  84% {
+    transform: translate3d(2.1px, -0.6px, 0);
+  }
+  86% {
+    transform: translate3d(-1.4px, 0.4px, 0);
+  }
+  88% {
+    transform: translate3d(0.8px, -0.2px, 0);
+  }
+  92% {
+    transform: translate3d(-0.3px, 0.1px, 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes cooling-wave {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.22);
+  }
+  16% {
+    opacity: 0.7;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(5.2);
+  }
+}
+
+@keyframes cooling-ring {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.35);
+  }
+  14% {
+    opacity: 0.88;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(7.4);
+  }
+}
+
+@keyframes cooling-fade {
+  0% {
+    opacity: 0;
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes brightness-pulse {
+  0%,
+  58% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  62% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  68% {
+    opacity: 0.88;
+    transform: scale(1.15);
+  }
+  74% {
+    opacity: 1;
+    transform: scale(1.4);
+  }
+  82% {
+    opacity: 0.62;
+    transform: scale(1.8);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.2);
+  }
+}
+
+.login-scene {
+  background-color: #000;
+  isolation: isolate;
+  transition: color 1.35s ease;
+}
+
+.login-scene::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 0;
+  background: radial-gradient(circle at 20% 10%, #f8fafc 0%, #e2e8f0 50%, #dbeafe 100%);
+  transition: opacity 1.55s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.login-panel,
+.login-card,
+.login-logo,
+.login-heading,
+.login-muted,
+.login-subtle,
+.starfield-layer::before,
+.starfield-layer-soft::before {
+  transition:
+    background-color 1.45s ease,
+    border-color 1.45s ease,
+    color 1.3s ease,
+    opacity 1.3s ease,
+    box-shadow 1.45s ease;
+}
+
+.login-logo-stack {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+
+.login-logo-stack .login-logo {
+  display: block;
+  transition: opacity 700ms ease;
+}
+
+.login-logo-dark {
+  opacity: 1;
+}
+
+.login-logo-light {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+}
+
+.login-scene.light-mode::before {
+  opacity: 1;
+}
+
+.login-scene.light-mode .starfield-layer::before,
+.login-scene.light-mode .starfield-layer-soft::before {
+  opacity: 0.08;
+}
+
+.login-scene.light-mode .shooting-star {
+  opacity: 0.42;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(251, 146, 60, 0.98), rgba(245, 158, 11, 0));
+  filter: drop-shadow(0 0 8px rgba(251, 146, 60, 0.6));
+}
+
+.login-scene.light-mode .login-panel {
+  background: rgba(248, 250, 252, 0.68);
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.login-scene.light-mode .login-card {
+  background: rgba(255, 255, 255, 0.82);
+  border-color: rgba(148, 163, 184, 0.35);
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
+}
+
+.login-scene.light-mode .login-logo-dark {
+  opacity: 0;
+}
+
+.login-scene.light-mode .login-logo-light {
+  opacity: 1;
+}
+
+.login-scene.light-mode .login-heading {
+  color: #0f172a;
+}
+
+.login-scene.light-mode .login-muted {
+  color: #334155;
+}
+
+.login-scene.light-mode .login-subtle {
+  color: #64748b;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .starfield-layer::before,
+  .starfield-layer-soft::before,
+  .shooting-star,
+  .asteroid-body,
+  .asteroid-tail,
+  .impact-burst,
+  .impact-ring,
+  .impact-flash,
+  .cooling-wave,
+  .cooling-ring,
+  .cooling-fade {
+    animation: none;
+  }
+
+  .shooting-star,
+  .asteroid-body,
+  .asteroid-tail,
+  .impact-burst,
+  .impact-ring,
+  .impact-flash,
+  .cooling-wave,
+  .cooling-ring,
+  .cooling-fade {
+    display: none;
+  }
+}

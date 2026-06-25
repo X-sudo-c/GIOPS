@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GIOP — Grid Intelligent Operating Platform</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="theme.js"></script>
+  <link rel="icon" href="data:,">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map, #cy { width: 100%; height: 100%; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 h-screen flex flex-col overflow-hidden">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between px-6 py-3 border-b border-slate-800 shrink-0">
+    <div>
+      <h1 class="text-xl font-bold tracking-wide">GIOP</h1>
+      <p class="text-xs text-slate-400">Ghana Local Prototyping Module</p>
+    </div>
+    <div class="flex items-center gap-2 text-sm text-slate-300">
+      <div id="status-dot" class="status-dot bg-slate-500"></div>
+      <span id="status-text">Idle</span>
+    </div>
+  </header>
+
+  <!-- Top panels: map + topology -->
+  <div class="flex flex-1 min-h-0" style="height: 60%;">
+    <div class="w-1/2 border-r border-slate-800 relative">
+      <div id="map"></div>
+    </div>
+    <div class="w-1/2 flex flex-col">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-slate-800 shrink-0">
+        <span class="text-sm font-medium text-slate-300">Network Topology</span>
+        <button
+          id="trace-btn"
+          class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm font-medium transition"
+        >
+          Trace Network
+        </button>
+      </div>
+      <div class="flex-1 min-h-0">
+        <div id="cy"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom panels: assets + meter OCR -->
+  <div class="border-t border-slate-800 shrink-0 flex" style="height: 40%;">
+    <div class="w-1/2 border-r border-slate-800 flex flex-col min-w-0">
+    <div class="px-6 py-3 border-b border-slate-800 shrink-0 flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-slate-300">Asset Verification</h2>
+      <button id="repair-btn" class="px-3 py-1 bg-amber-700 hover:bg-amber-600 rounded text-xs font-medium">
+        One-Click Topology Repair
+      </button>
+    </div>
+    <div class="overflow-auto flex-1">
+      <table class="w-full text-sm text-left">
+        <thead class="text-xs text-slate-400 uppercase bg-slate-900 sticky top-0">
+          <tr>
+            <th class="px-6 py-3">Asset MRID</th>
+            <th class="px-6 py-3">Name</th>
+            <th class="px-6 py-3">Tier</th>
+            <th class="px-6 py-3">Validation State</th>
+            <th class="px-6 py-3">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="asset-table-body" class="divide-y divide-slate-800">
+          <tr class="hover:bg-slate-900">
+            <td class="px-6 py-3 font-mono text-xs">a0000000-0000-0000-0000-000000000001</td>
+            <td class="px-6 py-3">Pokuaa Bulk Supply Point (BSP)</td>
+            <td class="px-6 py-3">—</td>
+            <td class="px-6 py-3">
+              <span class="px-2 py-0.5 rounded text-xs bg-green-900 text-green-300">APPROVED</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    </div>
+
+    <!-- Meter OCR -->
+    <div class="w-1/2 flex flex-col min-w-0">
+      <div class="px-6 py-3 border-b border-slate-800 shrink-0">
+        <h2 class="text-sm font-semibold text-slate-300">Meter Reading (OCR)</h2>
+      </div>
+      <div class="flex-1 overflow-auto px-6 py-4 space-y-4">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Meter photo</label>
+          <input
+            id="meter-image"
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            class="block w-full text-sm text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:bg-slate-800 file:text-slate-200"
+          />
+        </div>
+        <button
+          id="ocr-btn"
+          class="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 rounded text-sm font-medium transition disabled:opacity-50"
+        >
+          Extract with OCR
+        </button>
+        <div id="ocr-preview" class="hidden">
+          <img id="ocr-thumb" alt="Preview" class="max-h-24 rounded border border-slate-700" />
+        </div>
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Serial number</label>
+            <input id="ocr-serial" type="text" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 font-mono text-xs" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">kWh reading</label>
+            <input id="ocr-kwh" type="number" step="0.001" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 font-mono text-xs" />
+          </div>
+          <div class="col-span-2">
+            <label class="block text-xs text-slate-400 mb-1">Meter MRID</label>
+            <input id="ocr-mrid" type="text" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 font-mono text-xs" placeholder="Resolved from registry or enter manually" />
+          </div>
+        </div>
+        <p id="ocr-status" class="text-xs text-slate-500"></p>
+        <button
+          id="telemetry-btn"
+          class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium transition disabled:opacity-50"
+          disabled
+        >
+          Confirm &amp; Submit Telemetry
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const TRACE_URL = 'http://localhost:5000/api/v1/trace';
+    const SYNC_URL = 'http://localhost:5000';
+    const OCR_URL = 'http://localhost:5002/api/v1/meter/ocr';
+    const TELEMETRY_URL = 'http://localhost:5000/api/v1/telemetry/submit';
+    const START_MRID = 'a0000000-0000-0000-0000-000000000001';
+    const SUPABASE_URL = 'http://127.0.0.1:54321';
+  // Local Supabase demo anon key (from `npx supabase status`)
+    const SUPABASE_ANON_KEY =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0';
+
+    const MARTIN_SOURCES = [
+      { id: 'connectivity_nodes', layerId: 'nodes' },
+      { id: 'ac_line_segments', layerId: 'lines' },
+    ];
+
+    let traceLoaded = false;
+    let refreshTimer = null;
+    let assetRows = [];
+    let selectedMrid = null;
+
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    function setStatus(state, text) {
+      const colors = {
+        idle: 'bg-slate-500',
+        loading: 'bg-yellow-400 animate-pulse',
+        success: 'bg-green-400',
+        error: 'bg-red-500',
+        live: 'bg-cyan-400',
+      };
+      statusDot.className = 'status-dot ' + (colors[state] || colors.idle);
+      statusText.textContent = text;
+    }
+
+    let stagingRefreshTimer;
+
+    function debouncedStagingRefresh(reason) {
+      clearTimeout(stagingRefreshTimer);
+      setStatus('loading', `Staging (${reason})…`);
+      refreshAssetTable();
+      stagingRefreshTimer = setTimeout(() => {
+        setStatus('live', 'Live — watching database');
+      }, 400);
+    }
+
+    function debouncedLiveRefresh(reason) {
+      clearTimeout(refreshTimer);
+      setStatus('loading', `Live update (${reason})…`);
+      refreshMapTiles();
+      refreshAssetTable();
+      // Postgres realtime fires before Memgraph webhook finishes — brief delay for trace
+      refreshTimer = setTimeout(async () => {
+        if (traceLoaded) {
+          await fetchTrace({ silent: true });
+        }
+        setStatus('live', 'Live — watching database');
+      }, 1200);
+    }
+
+    // --- MapLibre ---
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          'carto-dark': {
+            type: 'raster',
+            tiles: ['https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            attribution:
+              '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+          },
+          connectivity_nodes: {
+            type: 'vector',
+            tiles: ['http://localhost:3001/connectivity_nodes/{z}/{x}/{y}'],
+          },
+          ac_line_segments: {
+            type: 'vector',
+            tiles: ['http://localhost:3001/ac_line_segments/{z}/{x}/{y}'],
+          },
+        },
+        layers: [
+          {
+            id: 'basemap',
+            type: 'raster',
+            source: 'carto-dark',
+          },
+          {
+            id: 'lines',
+            type: 'line',
+            source: 'ac_line_segments',
+            'source-layer': 'ac_line_segments',
+            paint: {
+              'line-color': '#1D4ED8',
+              'line-width': 2.5,
+              'line-opacity': 0.8,
+            },
+          },
+          {
+            id: 'nodes',
+            type: 'circle',
+            source: 'connectivity_nodes',
+            'source-layer': 'connectivity_nodes',
+            paint: {
+              'circle-radius': 8,
+              'circle-color': '#3b82f6',
+              'circle-stroke-width': 2,
+              'circle-stroke-color': '#ffffff',
+            },
+          },
+        ],
+      },
+      center: [-0.2941, 5.6812],
+      zoom: 11,
+    });
+
+    function refreshMapTiles() {
+      const v = Date.now();
+      for (const { id } of MARTIN_SOURCES) {
+        const src = map.getSource(id);
+        if (src && typeof src.setTiles === 'function') {
+          src.setTiles([`http://localhost:3001/${id}/{z}/{x}/{y}?v=${v}`]);
+        }
+      }
+      map.triggerRepaint();
+    }
+
+    map.on('load', () => {
+      refreshAssetTable();
+      fetchTrace({ silent: true }).catch(() => {});
+      setStatus('live', 'Live — watching database');
+    });
+
+    // --- Cytoscape ---
+    cytoscape.use(cytoscapeDagre);
+
+    const cy = cytoscape({
+      container: document.getElementById('cy'),
+      style: window.GIOP_CYTOSCAPE_THEME,
+      layout: { name: 'dagre', rankDir: 'TB' },
+    });
+
+    function renderTrace(data) {
+      const elements = [];
+
+      for (const node of data.nodes) {
+        elements.push({
+          data: {
+            id: node.mrid,
+            label: node.name || node.mrid,
+            validation: node.validation || 'APPROVED',
+            connected: node.connected === false ? 'false' : 'true',
+          },
+        });
+      }
+
+      for (const edge of data.edges) {
+        elements.push({
+          data: {
+            id: edge.mrid || `${edge.source}-${edge.target}`,
+            source: edge.source,
+            target: edge.target,
+            voltage: edge.voltage,
+          },
+        });
+      }
+
+      cy.elements().remove();
+      cy.add(elements);
+      cy.layout({ name: 'dagre', rankDir: 'TB' }).run();
+    }
+
+    async function fetchTrace({ silent = false } = {}) {
+      if (!silent) setStatus('loading', 'Tracing network…');
+      try {
+        const res = await fetch(`${TRACE_URL}?start_mrid=${START_MRID}`);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        renderTrace(data);
+        traceLoaded = true;
+        if (!silent) {
+          setStatus('success', `Traced ${data.nodes.length} nodes, ${data.edges.length} edges`);
+        }
+        return data;
+      } catch (err) {
+        if (!silent) {
+          setStatus('error', err.message);
+        }
+        console.error(err);
+        throw err;
+      }
+    }
+
+    function validationBadge(validation) {
+      if (validation === 'APPROVED') return 'bg-green-900 text-green-300';
+      if (validation === 'IN_CONFLICT') return 'bg-red-900 text-red-300';
+      if (validation === 'PENDING_FIELD') return 'bg-amber-900 text-amber-300';
+      if (validation === 'STAGED') return 'bg-blue-900 text-blue-300';
+      return 'bg-slate-800 text-slate-300';
+    }
+
+    function highlightMapNode(mrid, geom) {
+      selectedMrid = mrid;
+      if (geom?.coordinates) {
+        map.flyTo({ center: geom.coordinates, zoom: 14 });
+      }
+      cy.nodes().removeClass('highlighted');
+      const n = cy.getElementById(mrid);
+      if (n.length) n.addClass('highlighted');
+    }
+
+    async function patchAssetName(mrid, name) {
+      const res = await fetch(`${SYNC_URL}/api/v1/assets/${mrid}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Name update HTTP ${res.status}`);
+      }
+    }
+
+    async function approveAsset(mrid) {
+      const res = await fetch(`${SYNC_URL}/api/v1/assets/${mrid}/validation`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ validation: 'APPROVED' }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Approve HTTP ${res.status}`);
+      }
+      await refreshAssetTable();
+    }
+
+    async function refreshAssetTable() {
+      const tbody = document.getElementById('asset-table-body');
+      try {
+        const res = await fetch(`${SYNC_URL}/api/v1/assets/staging`);
+        if (!res.ok) throw new Error(`Staging assets HTTP ${res.status}`);
+        const data = await res.json();
+        const rows = data.assets ?? [];
+        assetRows = rows;
+        if (!rows.length) {
+          tbody.innerHTML =
+            '<tr><td colspan="5" class="px-6 py-3 text-slate-500">No pending field assets — captures appear here before approval</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows
+          .map((row) => {
+            const name = row.name ?? '—';
+            const validation = row.validation ?? '—';
+            const badge = validationBadge(validation);
+            const canApprove = validation === 'PENDING_FIELD' || validation === 'STAGED';
+            const approveBtn = canApprove
+              ? `<button data-approve="${row.mrid}" class="text-xs px-2 py-0.5 bg-emerald-800 hover:bg-emerald-700 rounded">Approve → Master</button>`
+              : '';
+            return `<tr class="hover:bg-slate-900 asset-row cursor-pointer" data-mrid="${row.mrid}">
+              <td class="px-6 py-3 font-mono text-xs">${row.mrid}</td>
+              <td class="px-6 py-3">
+                <input type="text" class="asset-name-input bg-slate-900 border border-slate-700 rounded px-1 py-0.5 text-sm w-full" data-mrid="${row.mrid}" value="${name.replace(/"/g, '&quot;')}" />
+              </td>
+              <td class="px-6 py-3"><span class="text-xs text-amber-400">staging</span></td>
+              <td class="px-6 py-3"><span class="px-2 py-0.5 rounded text-xs ${badge}">${validation}</span></td>
+              <td class="px-6 py-3">${approveBtn}</td>
+            </tr>`;
+          })
+          .join('');
+
+        tbody.querySelectorAll('.asset-row').forEach((tr) => {
+          tr.addEventListener('click', (e) => {
+            if (e.target.closest('button') || e.target.closest('input')) return;
+            const mrid = tr.dataset.mrid;
+            const row = assetRows.find((r) => r.mrid === mrid);
+            highlightMapNode(mrid, row?.geom?.coordinates ? { coordinates: row.geom.coordinates } : row?.geom);
+          });
+        });
+
+        tbody.querySelectorAll('.asset-name-input').forEach((input) => {
+          input.addEventListener('change', async () => {
+            try {
+              await patchAssetName(input.dataset.mrid, input.value.trim());
+              setStatus('success', 'Name updated');
+            } catch (err) {
+              setStatus('error', err.message);
+            }
+          });
+        });
+
+        tbody.querySelectorAll('[data-approve]').forEach((btn) => {
+          btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+              setStatus('loading', 'Approving & promoting to master…');
+              await approveAsset(btn.dataset.approve);
+              refreshMapTiles();
+              await fetchTrace({ silent: true });
+              setStatus('success', 'Asset promoted to master');
+            } catch (err) {
+              setStatus('error', err.message);
+            }
+          });
+        });
+      } catch (err) {
+        console.error('Asset table refresh failed:', err);
+      }
+    }
+
+    document.getElementById('repair-btn').addEventListener('click', async () => {
+      const mrid = selectedMrid || START_MRID;
+      setStatus('loading', 'Running topology repair…');
+      try {
+        const res = await fetch(`${SYNC_URL}/api/v1/topology/repair`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target_mrid: mrid, radius_meters: 50 }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `Repair HTTP ${res.status}`);
+        setStatus('success', `Repair complete for ${mrid}`);
+        await refreshAssetTable();
+        if (traceLoaded) await fetchTrace({ silent: true });
+      } catch (err) {
+        setStatus('error', err.message);
+      }
+    });
+
+    document.getElementById('trace-btn').addEventListener('click', () => fetchTrace());
+
+    // --- Meter OCR ---
+    const meterImageInput = document.getElementById('meter-image');
+    const ocrBtn = document.getElementById('ocr-btn');
+    const telemetryBtn = document.getElementById('telemetry-btn');
+    const ocrSerial = document.getElementById('ocr-serial');
+    const ocrKwh = document.getElementById('ocr-kwh');
+    const ocrMrid = document.getElementById('ocr-mrid');
+    const ocrStatus = document.getElementById('ocr-status');
+    const ocrPreview = document.getElementById('ocr-preview');
+    const ocrThumb = document.getElementById('ocr-thumb');
+
+    function updateTelemetryButton() {
+      const mrid = ocrMrid.value.trim();
+      const kwh = parseFloat(ocrKwh.value);
+      telemetryBtn.disabled = !(mrid && kwh > 0);
+    }
+
+    [ocrMrid, ocrKwh].forEach((el) => el.addEventListener('input', updateTelemetryButton));
+
+    meterImageInput.addEventListener('change', () => {
+      const file = meterImageInput.files?.[0];
+      if (!file) {
+        ocrPreview.classList.add('hidden');
+        return;
+      }
+      ocrThumb.src = URL.createObjectURL(file);
+      ocrPreview.classList.remove('hidden');
+      ocrStatus.textContent = '';
+    });
+
+    ocrBtn.addEventListener('click', async () => {
+      const file = meterImageInput.files?.[0];
+      if (!file) {
+        ocrStatus.textContent = 'Select a meter photo first.';
+        ocrStatus.className = 'text-xs text-amber-400';
+        return;
+      }
+
+      ocrBtn.disabled = true;
+      ocrStatus.textContent = 'Running PaddleOCR…';
+      ocrStatus.className = 'text-xs text-slate-400';
+
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        const res = await fetch(OCR_URL, { method: 'POST', body: form });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || `OCR HTTP ${res.status}`);
+        }
+
+        ocrSerial.value = data.extracted_serial || '';
+        ocrKwh.value = data.extracted_kwh != null ? data.extracted_kwh : '';
+        ocrMrid.value = data.meter_mrid || '';
+
+        const serialConf = data.serial_confidence != null ? `${(data.serial_confidence * 100).toFixed(0)}%` : '—';
+        const kwhConf = data.kwh_confidence != null ? `${(data.kwh_confidence * 100).toFixed(0)}%` : '—';
+        const match = data.registry_match ? 'Registry match' : 'Serial not in registry — enter MRID manually';
+        ocrStatus.textContent = `Serial conf: ${serialConf} · kWh conf: ${kwhConf} · ${match}`;
+        ocrStatus.className = data.registry_match ? 'text-xs text-green-400' : 'text-xs text-amber-400';
+        updateTelemetryButton();
+      } catch (err) {
+        ocrStatus.textContent = err.message;
+        ocrStatus.className = 'text-xs text-red-400';
+      } finally {
+        ocrBtn.disabled = false;
+      }
+    });
+
+    telemetryBtn.addEventListener('click', async () => {
+      const meter_mrid = ocrMrid.value.trim();
+      const active_energy_kwh = parseFloat(ocrKwh.value);
+      if (!meter_mrid || !(active_energy_kwh > 0)) return;
+
+      telemetryBtn.disabled = true;
+      ocrStatus.textContent = 'Submitting telemetry…';
+      ocrStatus.className = 'text-xs text-slate-400';
+
+      try {
+        const res = await fetch(TELEMETRY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meter_mrid, active_energy_kwh }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `Telemetry HTTP ${res.status}`);
+        ocrStatus.textContent = 'Telemetry ingested successfully.';
+        ocrStatus.className = 'text-xs text-green-400';
+      } catch (err) {
+        ocrStatus.textContent = err.message;
+        ocrStatus.className = 'text-xs text-red-400';
+        updateTelemetryButton();
+      }
+    });
+
+    // --- Supabase Realtime: auto-refresh map, trace, table on DB changes ---
+    try {
+      const { createClient } = window.supabase;
+      const supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+      supabaseClient
+        .channel('giop-grid')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'staging', table: 'connectivity_nodes' },
+          (payload) => debouncedStagingRefresh(`staging nodes ${payload.eventType}`),
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'staging', table: 'identified_objects' },
+          (payload) => debouncedStagingRefresh(`staging assets ${payload.eventType}`),
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'connectivity_nodes' },
+          (payload) => debouncedLiveRefresh(`nodes ${payload.eventType}`),
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'ac_line_segments' },
+          (payload) => debouncedLiveRefresh(`lines ${payload.eventType}`),
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'identified_objects' },
+          (payload) => debouncedLiveRefresh(`assets ${payload.eventType}`),
+        )
+        .subscribe((status, err) => {
+          if (status === 'SUBSCRIBED') {
+            console.log('GIOP realtime subscribed');
+            setStatus('live', 'Live — watching database');
+          } else if (status === 'CHANNEL_ERROR' || err) {
+            console.warn('Realtime unavailable:', err);
+            setStatus('idle', 'Realtime off — manual refresh');
+          }
+        });
+    } catch (err) {
+      console.error('Supabase realtime init failed:', err);
+      setStatus('idle', 'Realtime off — map & trace still work');
+    }
+  </script>
+</body>
+</html>

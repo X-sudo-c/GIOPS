@@ -1,0 +1,529 @@
+This guide provides a step-by-step engineering manual to build, run, and verify the Grid Intelligent Operating Platform (GIOP) in a local development environment.
+By the end of this guide, you will have a working local MVP tailored to the Ghana Power System (ECG/NEDCo) framework. It features hot-reloading code tiers, live database event routers, an on-demand vector tile server, and an interactive backoffice spreadsheet canvas.
+
+🛠️ Step 1: Initialize the Host Directory Architecture
+Open your terminal and build out the directory tree. This isolates configurations, database scripts, and microservice tiers. [1]
+bash
+# Create unified directory tree structure
+mkdir -p giop-mvp-workspace/{config,database,sync-service,backoffice-ui,mobile}
+cd giop-mvp-workspace/
+Use code with caution.
+
+🐋 Step 2: Provision Local Composable Infrastructure
+Save the complete script block below to your workspace root directory as docker-compose.yml. This maps shared local network loops and manages prototyping containers automatically.
+yaml
+version: '3.8'
+
+networks:
+  giop-mvp-mesh:
+    driver: bridge
+
+volumes:
+  giop_dev_postgres:
+  giop_dev_timescale:
+  giop_dev_memgraph:
+
+services:
+  # Core Spatial Database (Supabase PostgreSQL / PostGIS Metadata Vault)
+  supabase-db:
+    image: supabase/postgres:15.1.1.78
+    container_name: giop-dev-postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: giop_mvp_secret_password
+    volumes:
+      - giop_dev_postgres:/var/lib/postgresql/data
+    networks:
+      - giop-mvp-mesh
+    ports:
+      - "5432:5432"
+
+  # M2C Time-Series DB (TimescaleDB Ingestion Core)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: giop-dev-timescale
+    environment:
+      POSTGRES_PASSWORD: giop_dev_telemetry_pass
+      POSTGRES_DB: telemetry
+    volumes:
+      - giop_dev_timescale:/var/lib/postgresql/data
+    networks:
+      - giop-mvp-mesh
+    ports:
+      - "5433:5432"
+
+  # On-Demand Vector Tile Engine (Martin)
+  tile-server-martin:
+    image: maplibre/martin:latest
+    container_name: giop-dev-martin
+    environment:
+      - CONNECTION_STRING=postgresql://postgres:giop_mvp_secret_password@supabase-db:5432/postgres
+    ports:
+      - "3001:3001"
+    depends_on:
+      - supabase-db
+    networks:
+      - giop-mvp-mesh
+
+  # In-Memory Topology Graph Engine (Memgraph)
+  memgraph-graph:
+    image: memgraph/memgraph-mage:latest
+    container_name: giop-dev-memgraph
+    ports:
+      - "7687:7687"
+      - "9091:9091"
+    volumes:
+      - giop_dev_memgraph:/var/lib/memgraph
+    networks:
+      - giop-mvp-mesh
+
+  # Backend Integration Gateway (FastAPI with Hot-Reload)
+  fastapi-sync-service:
+    build:
+      context: ./sync-service
+      dockerfile: Dockerfile.dev
+    container_name: giop-dev-fastapi
+    environment:
+      GRAPH_DB_URI: bolt://memgraph-graph:7687
+      TIMESCALE_URI: postgresql://postgres:giop_dev_telemetry_pass@timescaledb:5432/telemetry
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./sync-service:/app
+    depends_on:
+      - memgraph-graph
+    networks:
+      - giop-mvp-mesh
+Use code with caution.
+
+🐍 Step 3: Compile the Hot-Reload Microservice Layer
+Save the following three files inside the ./sync-service/ folder path:
+A. ./sync-service/Dockerfile.dev
+dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc curl && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+EXPOSE 5000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--reload"]
+Use code with caution.
+B. ./sync-service/requirements.txt
+text
+fastapi==0.110.0
+uvicorn==0.28.0
+pydantic==2.6.4
+neo4j==5.18.0
+psycopg2-binary==2.9.9
+requests==2.31.0
+Use code with caution.
+C. ./sync-service/main.py
+python
+import os
+import psycopg2
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+from neo4j import GraphDatabase
+
+app = FastAPI(title="GIOP Dev Sync Gateway")
+
+GRAPH_URI = os.getenv("GRAPH_DB_URI", "bolt://memgraph-graph:7687")
+graph_driver = GraphDatabase.driver(GRAPH_URI, auth=("", ""))
+TIMESCALE_URI = os.getenv("TIMESCALE_URI")
+
+class WebhookPayload(BaseModel):
+    type: str
+    table: str
+    record: Optional[Dict[str, Any]] = None
+    old_record: Optional[Dict[str, Any]] = None
+
+class TelemetryPayload(BaseModel):
+    meter_mrid: str
+    active_energy_kwh: float
+
+def sync_to_graph_store(payload: WebhookPayload):
+    action = payload.type
+    rec = payload.record if action in ["INSERT", "UPDATE"] else payload.old_record
+    if not rec or "mrid" not in rec: return
+
+    with graph_driver.session() as session:
+        if payload.table == "connectivity_nodes":
+            if action in ["INSERT", "UPDATE"]:
+                session.run("MERGE (c:ConnectivityNode {mrid: $mrid}) SET c.name = $name", 
+                            {"mrid": rec["mrid"], "name": rec.get("name", "Node")})
+            elif action == "DELETE":
+                session.run("MATCH (c:ConnectivityNode {mrid: $mrid}) DETACH DELETE c", {"mrid": rec["mrid"]})
+        elif payload.table == "ac_line_segments":
+            if action in ["INSERT", "UPDATE"]:
+                session.run("""
+                MATCH (s {mrid: $source_id}), (t {mrid: $target_id})
+                MERGE (s)-[r:AC_LINE_SEGMENT {mrid: $mrid}]->(t)
+                SET r.direction_downstream = $direction, r.phases = $phases, r.voltage = $voltage
+                """, {
+                    "mrid": rec["mrid"], "source_id": rec["source_node_id"], "target_id": rec["target_node_id"],
+                    "direction": rec.get("direction_downstream", True), "phases": rec.get("phases", "ABC"),
+                    "voltage": rec.get("nominal_voltage", "MV_11KV")
+                })
+
+@app.post("/webhook/supabase-sync")
+async def handle_supabase_sync(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    background_tasks.add_task(sync_to_graph_store, payload)
+    return {"status": "queued"}
+
+@app.post("/api/v1/telemetry/submit")
+async def log_meter_interval(payload: TelemetryPayload):
+    try:
+        conn = psycopg2.connect(TIMESCALE_URI)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.meter_readings (meter_mrid, reading_timestamp, active_energy_kwh) VALUES (%s, NOW(), %s);",
+                (payload.meter_mrid, payload.active_energy_kwh)
+            )
+            conn.commit()
+        conn.close()
+        return {"status": "ingested"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/trace")
+async def execute_trace(start_mrid: str):
+    query = "MATCH (s {mrid: $mrid}) MATCH p = (s)-[:AC_LINE_SEGMENT*1..10]->(c) RETURN p"
+    nodes_out, edges_out = {}, []
+    with graph_driver.session() as session:
+        res = session.run(query, {"mrid": start_mrid})
+        for record in res:
+            path = record["p"]
+            for n in path.nodes: nodes_out[n["mrid"]] = {"mrid": n["mrid"], "name": n.get("name", "Node"), "type": list(n.labels)}
+            for r in path.relationships: edges_out.append({"mrid": r["mrid"], "source": r.start_node["mrid"], "target": r.end_node["mrid"], "phases": r.get("phases", "ABC"), "voltage": r.get("voltage", "MV_11KV")})
+    return {"nodes": list(nodes_out.values()), "edges": edges_out}
+Use code with caution.
+
+🗄️ Step 4: Setup Master Relational and Time-Series DDLs
+Save these migration scripts inside the ./database/ folder path:
+A. ./database/schema.sql (Supabase Postgres DDL)
+sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "postgis";
+
+CREATE TYPE public.asset_lifecycle_state AS ENUM ('PLANNING', 'IN_CONSTRUCTION', 'IN_SERVICE', 'OUT_OF_SERVICE', 'ABANDONED');
+CREATE TYPE public.staging_validation_state AS ENUM ('PENDING_FIELD', 'STAGED', 'IN_CONFLICT', 'APPROVED');
+CREATE TYPE public.ghana_utility_enum AS ENUM ('ECG_SOUTHERN', 'NEDCO_NORTHERN', 'GRIDCO_TRANSMISSION');
+CREATE TYPE public.ghana_voltage_enum AS ENUM ('LV_230V', 'LV_400V', 'MV_11KV', 'MV_33KV', 'HV_161KV', 'HV_330KV');
+
+CREATE TABLE public.identified_objects (
+    mrid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL,
+    lifecycle_state public.asset_lifecycle_state DEFAULT 'PLANNING',
+    validation public.staging_validation_state DEFAULT 'PENDING_FIELD',
+    error_log TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE public.connectivity_nodes (
+    mrid UUID PRIMARY KEY REFERENCES public.identified_objects(mrid) ON DELETE CASCADE,
+    boundary_feeder_id VARCHAR(50),
+    geom GEOMETRY(Point, 4326) NOT NULL
+);
+CREATE INDEX idx_connectivity_nodes_spatial ON public.connectivity_nodes USING GIST(geom);
+
+CREATE TABLE public.conducting_equipment (
+    mrid UUID PRIMARY KEY REFERENCES public.identified_objects(mrid) ON DELETE CASCADE,
+    phases VARCHAR(10) DEFAULT 'ABC',
+    nominal_voltage public.ghana_voltage_enum NOT NULL,
+    serial_number VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE public.ac_line_segments (
+    mrid UUID PRIMARY KEY REFERENCES public.conducting_equipment(mrid) ON DELETE CASCADE,
+    source_node_id UUID REFERENCES public.connectivity_nodes(mrid),
+    target_node_id UUID REFERENCES public.connectivity_nodes(mrid),
+    direction_downstream BOOLEAN DEFAULT TRUE,
+    geom GEOMETRY(LineString, 4326) NOT NULL
+);
+CREATE INDEX idx_ac_line_segments_spatial ON public.ac_line_segments USING GIST(geom);
+
+CREATE TABLE public.ghana_grid_assets (
+    mrid UUID PRIMARY KEY REFERENCES public.identified_objects(mrid) ON DELETE CASCADE,
+    operating_utility public.ghana_utility_enum NOT NULL,
+    substation_name VARCHAR(100) NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION public.intercept_sync_collision()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.identified_objects WHERE mrid = NEW.mrid AND updated_at > OLD.updated_at) THEN
+        NEW.validation := 'IN_CONFLICT'::public.staging_validation_state;
+        NEW.error_log := 'Conflict Exception: Parallel modification identified.';
+    ELSE
+        NEW.validation := 'STAGED'::public.staging_validation_state;
+        NEW.updated_at := NOW();
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_collision_shield BEFORE UPDATE ON public.identified_objects
+FOR EACH ROW WHEN (NEW.validation = 'PENDING_FIELD') EXECUTE FUNCTION public.intercept_sync_collision();
+Use code with caution.
+B. ./database/timescale.sql (TimescaleDB DDL)
+sql
+CREATE TABLE public.meter_readings (
+    id BIGSERIAL,
+    meter_mrid UUID NOT NULL,
+    reading_timestamp TIMESTAMPTZ NOT NULL,
+    active_energy_kwh NUMERIC(10,3) NOT NULL,
+    PRIMARY KEY (id, reading_timestamp)
+);
+SELECT create_hypertable('public.meter_readings', 'reading_timestamp');
+Use code with caution.
+C. ./database/seed_high_load.sql (Ghana Power System MVP Seeds)
+sql
+BEGIN;
+INSERT INTO public.identified_objects (mrid, name, lifecycle_state, validation) VALUES 
+('a0000000-0000-0000-0000-000000000001', 'Pokuaa Bulk Supply Point (BSP)', 'IN_SERVICE', 'APPROVED'),
+('a0000000-0000-0000-0000-000000000002', 'Anyaa Junction Feeder Sub-Node', 'IN_SERVICE', 'APPROVED'),
+('a0000000-0000-0000-0000-000000000003', 'Mallam Secondary Distribution Node', 'IN_SERVICE', 'APPROVED');
+
+INSERT INTO public.connectivity_nodes (mrid, boundary_feeder_id, geom) VALUES 
+('a0000000-0000-0000-0000-000000000001', 'FEEDER-GRIDCO-POKUAA-01', ST_SetSRID(ST_MakePoint(-0.2941, 5.6812), 4326)),
+('a0000000-0000-0000-0000-000000000002', 'FEEDER-ECG-ANYAA-11K', ST_SetSRID(ST_MakePoint(-0.2891, 5.6104), 4326)),
+('a0000000-0000-0000-0000-000000000003', 'FEEDER-ECG-MALLAM-04', ST_SetSRID(ST_MakePoint(-0.2810, 5.5721), 4326));
+
+INSERT INTO public.ghana_grid_assets (mrid, operating_utility, substation_name) VALUES 
+('a0000000-0000-0000-0000-000000000001', 'GRIDCO_TRANSMISSION', 'Pokuaa Bulk Supply Point (BSP)'),
+('a0000000-0000-0000-0000-000000000002', 'ECG_SOUTHERN', 'Anyaa 11kV Primary Feeder'),
+('a0000000-0000-0000-0000-000000000003', 'ECG_SOUTHERN', 'Mallam Primary Substation');
+
+INSERT INTO public.identified_objects (mrid, name, lifecycle_state, validation) VALUES 
+('e0000000-0000-0000-0000-000000000001', 'Pokuaa-Anyaa 33kV Intertie Conductor', 'IN_SERVICE', 'APPROVED'),
+('e0000000-0000-0000-0000-000000000002', 'Anyaa-Mallam 11kV Conductor Trunk', 'IN_SERVICE', 'APPROVED');
+
+INSERT INTO public.conducting_equipment (mrid, phases, nominal_voltage, serial_number) VALUES 
+('e0000000-0000-0000-0000-000000000001', 'ABC', 'MV_33KV', 'GRIDCO-WIRE-P-A'),
+('e0000000-0000-0000-0000-000000000002', 'ABC', 'MV_11KV', 'ECG-WIRE-A-M');
+
+INSERT INTO public.ac_line_segments (mrid, source_node_id, target_node_id, direction_downstream, geom) VALUES 
+('e0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', true, ST_SetSRID(ST_MakeLine(ST_MakePoint(-0.2941, 5.6812), ST_MakePoint(-0.2891, 5.6104)), 4326)),
+('e0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003', true, ST_SetSRID(ST_MakeLine(ST_MakePoint(-0.2891, 5.6104), ST_MakePoint(-0.2810, 5.5721)), 4326));
+COMMIT;
+Use code with caution.
+
+💻 Step 5: Mount the Single-Page Data Grid Dashboard
+Save this asset as: ./backoffice-ui/index.html
+html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>GIOP Prototyping Panel</title>
+    <script src="https://tailwindcss.com"></script>
+    <script src="https://unpkg.com"></script>
+    <link href="https://unpkg.com" rel="stylesheet" />
+    <script src="https://cloudflare.com"></script>
+    <script src="https://jsdelivr.net"></script>
+    <script src="https://jsdelivr.net"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 h-screen flex flex-col overflow-hidden">
+    <header class="bg-slate-900 p-4 flex justify-between items-center border-b border-slate-800 shadow-md">
+        <div>
+            <h1 class="text-md font-bold tracking-tight text-white">Grid Intelligent Operating Platform (GIOP)</h1>
+            <p class="text-[11px] text-slate-400">Ghana Local Prototyping Module Console Node</p>
+        </div>
+        <div id="status-panel" class="text-xs font-mono text-emerald-400 bg-slate-950 px-3 py-1.5 rounded border border-slate-800">State: Operational</div>
+    </header>
+    <div class="flex-1 flex flex-col overflow-hidden">
+        <div class="h-3/5 flex border-b border-slate-800">
+            <div class="w-1/2 h-full"><div id="map" class="w-full h-full"></div></div>
+            <div class="w-1/2 h-full flex flex-col border-l border-slate-800 bg-slate-900/30">
+                <div class="bg-slate-900 border-b border-slate-800 p-2 text-xs flex justify-between items-center">
+                    <span class="font-semibold text-slate-400">TOPOLOGY SCHEMA TREE VIEW</span>
+                    <button onclick="fetchActiveTrace()" class="bg-blue-600 hover:bg-blue-700 text-white text-[10px] px-2 py-1 rounded transition">Trace Network</button>
+                </div>
+                <div id="cy" class="flex-1 w-full"></div>
+            </div>
+        </div>
+        <div class="h-2/5 flex flex-col bg-slate-950">
+            <div class="bg-slate-900 border-b border-slate-800 p-2 text-xs font-semibold text-slate-400">INLINE ATTRIBUTE VERIFICATION LEDGER</div>
+            <div class="flex-1 overflow-auto p-2">
+                <table class="w-full text-left border-collapse text-xs text-slate-300">
+                    <thead>
+                        <tr class="bg-slate-900 text-slate-400 border-b border-slate-800 font-semibold">
+                            <th class="p-2 border-r border-slate-800">Asset Target MRID</th>
+                            <th class="p-2 border-r border-slate-800">Registry Alias</th>
+                            <th class="p-2 border-r border-slate-800">System Voltage Class</th>
+                            <th class="p-2">Validation State</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-900">
+                        <tr class="hover:bg-slate-900/40 transition">
+                            <td class="p-2 font-mono text-[11px] border-r border-slate-800/60">a0000000-0000-0000-0000-000000000001</td>
+                            <td class="p-2 border-r border-slate-800/60">Pokuaa BSP</td>
+                            <td class="p-2 border-r border-slate-800/60 text-amber-500 font-medium">HV_161KV (Brown)</td>
+                            <td class="p-2 text-emerald-400 font-semibold">APPROVED</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <script>
+        cytoscape.use(dagre);
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: { version: 8, sources: { 'martin-tiles': { type: 'vector', tiles: ['http://localhost:3001/public.connectivity_nodes/{z}/{x}/{y}.pbf'] } }, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#030712' } }, { id: 'nodes', type: 'circle', source: 'martin-tiles', 'source-layer': 'public.connectivity_nodes', paint: { 'circle-radius': 6, 'circle-color': '#3b82f6' } }] },
+            center: [-0.2941, 5.6812], zoom: 10
+        });
+        const theme = [
+            { selector: 'node', style: { 'background-color': '#475569', 'label': 'data(name)', 'color': '#f8fafc', 'font-size': '10px', 'text-valign': 'bottom', 'text-margin-y': 4, 'width': '22px', 'height': '22px' } },
+            { selector: 'edge', style: { 'width': 3, 'line-color': '#475569', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#475569', 'curve-style': 'taxi', 'taxi-direction': 'vertical', 'label': 'data(phases)', 'font-size': '8px' } },
+            { selector: 'edge[voltage="HV_161KV"]', style: { 'line-color': '#78350F', 'target-arrow-color': '#78350F', 'width': 5 } },
+            { selector: 'edge[voltage="MV_33KV"]', style: { 'line-color': '#1D4ED8', 'target-arrow-color': '#1D4ED8', 'width': 3.5 } },
+            { selector: 'edge[voltage="MV_11KV"]', style: { 'line-color': '#B91C1C', 'target-arrow-color': '#B91C1C', 'width': 2.5 } },
+            { selector: 'edge[voltage="LV_230V"]', style: { 'line-color': '#0F172A', 'target-arrow-color': '#0F172A', 'line-style': 'dashed', 'width': 1.5 } }
+        ];
+        async function fetchActiveTrace() {
+            document.getElementById('status-panel').innerText = "Querying Live Graph Engine Engine...";
+            try {
+                const res = await fetch('http://localhost:5000/api/v1/trace?start_mrid=a0000000-0000-0000-0000-000000000001');
+                const data = await res.json();
+                cytoscape({
+                    container: document.getElementById('cy'),
+                    elements: [
+                        ...data.nodes.map(n => ({ group: 'nodes', data: { id: n.mrid, name: n.name } })),
+                        ...data.edges.map(e => ({ group: 'edges', data: { id: e.mrid, source: e.source, target: e.target, phases: e.phases, voltage: e.voltage } }))
+                    ],
+                    style: theme,
+                    layout: { name: 'dagre', rankDir: 'TB' }
+                });
+                document.getElementById('status-panel').innerText = "Trace Render Complete";
+            } catch(e) {
+                document.getElementById('status-panel').innerText = "Trace Query Error";
+            }
+        }
+    </script>
+</body>
+</html>
+Use code with caution.
+
+🚀 Step 6: Step-by-Step Local Deployment & Initialization
+With the files saved to their respective directories, execute the setup and data seeding commands below:
+bash
+# 1. Boot up the core container stack ecosystem mesh
+docker-compose up -d --build
+
+# 2. Inject relational database structure blueprints to PostgreSQL Master instance
+docker exec -i giop-dev-postgres psql -U postgres -d postgres < database/schema.sql
+
+# 3. Inject time-series tables into the TimescaleDB container
+docker exec -i giop-dev-timescale psql -U postgres -d telemetry < database/timescale.sql
+
+# 4. Populated high-load Ghana grid testing seed entries
+docker exec -i giop-dev-postgres psql -U postgres -d postgres < database/seed_high_load.sql
+Use code with caution.
+
+🧪 Step 7: System Validation Checkpoints Matrix
+Run these diagnostic commands to verify that the integrated components are communicating correctly: [1]
+Checkpoint A: Verify Graph Gateway Engine Sync Loops
+Simulate an incoming update webhook from an offline field device to ensure the FastAPI microservice successfully synchronizes with Memgraph:
+bash
+# Push Pokuaa Bulk Supply Point Node into Graph Core
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"type": "INSERT", "table": "connectivity_nodes", "record": {"mrid": "a0000000-0000-0000-0000-000000000001", "name": "Pokuaa BSP"}}' \
+     http://localhost:5000/webhook/supabase-sync
+
+# Push Anyaa Junction Node into Graph Core
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"type": "INSERT", "table": "connectivity_nodes", "record": {"mrid": "a0000000-0000-0000-0000-000000000002", "name": "Anyaa Jct Node"}}' \
+     http://localhost:5000/webhook/supabase-sync
+
+# Link Nodes with a 161kV overhead transmission line edge relationship
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"type": "INSERT", "table": "ac_line_segments", "record": {"mrid": "e0000000-0000-0000-0000-000000000001", "source_node_id": "a0000000-0000-0000-0000-000000000001", "target_node_id": "a0000000-0000-0000-0000-000000000002", "nominal_voltage": "HV_161KV", "phases": "ABC", "direction_downstream": true}}' \
+     http://localhost:5000/webhook/supabase-sync
+Use code with caution.
+    • Expected Verification: Terminal output should return {"status":"queued"} for each operation. Check the API container logs (docker logs giop-dev-fastapi) to verify that the background synchronization tasks completed without throwing exceptions.
+Checkpoint B: Verify Vector Map Ingestion
+bash
+curl -s http://localhost:3001/public.connectivity_nodes/index.json
+Use code with caution.
+    • Expected Verification: The system should return a JSON metadata structure detailing your PostGIS coordinate constraints. This confirms the Rust-based Martin tile server has auto-discovered your database geometry extensions.
+Checkpoint C: Test Time-Series Ingestion Influx
+Simulate an incoming high-frequency billing interval transmission from a smart meter:
+bash
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"meter_mrid": "a0000000-0000-0000-0000-000000000001", "active_energy_kwh": 42.15}' \
+     http://localhost:5000/api/v1/telemetry/submit
+Use code with caution.
+    • Expected Verification: The route returns {"status":"ingested"}. Run docker exec -it giop-dev-timescale psql -U postgres -d telemetry -c "SELECT * FROM public.meter_readings;" to confirm that the row successfully wrote to the active hypertable partition.
+Checkpoint D: End-to-End User Experience Verification
+    1. Open the file dashboard panel ./backoffice-ui/index.html in any web browser interface path.
+    2. Click the Run Network Trace View button on the screen panel.
+    3. Expected Verification: The dashboard calls your local FastAPI router and renders a vertical Single-Line Diagram tree showing the Pokuaa BSP connected to the Anyaa Jct Node via a thick Brown line (161kV), confirming the graph processing layer is active and synchronized.
+
+
+
+
+
+
+
+
+Act as an Orchestrated Multi-Agent AI Development Cluster comprising four highly specialized sub-agents: 
+1. [Core Infra Architect] (Docker & Compose expert), 
+2. [Data Tier Engineer] (PostgreSQL/PostGIS & TimescaleDB specialist), 
+3. [Compute & AI Developer] (FastAPI, Neo4j/Memgraph, and Triton Systems engineer), and 
+4. [Frontend & Mobile Systems Engineer] (TypeScript, MapLibre, Cytoscape, and SQLite/SpatiaLite designer).
+
+Collaborate asynchronously to design and output a complete, un-truncated, production-grade, modular, and containerized local development codebase for the Grid Intelligent Operating Platform (GIOP). The platform is tailored specifically to the structural configurations, voltage profiles, and operational workflows of the Ghana Power System network (GRIDCo, ECG Southern Distribution, and NEDCo Northern Distribution).
+
+The platform must support edge-AI image-based validation, high-throughput Confluent Avro serialized billing ingestion streams, automated dual-pass geometric-attribute grid repair tools, and completely offline customer spot-billing systems.
+
+Execute the codebase development sequentially across the following 8 immutable system file modules. Write complete, production-ready code with defensive logging and explicit database indices. Do not use pseudocode or placeholders.
+
+### MODULE 1: COMPOSABLE DOCKER SERVICE ORCHESTRATION (`docker-compose.yml`)
+[Core Infra Architect] Provide a master local prototyping docker-compose configuration file isolating database files from public network borders via a discrete back-end VLAN bridge ('giop-db-isolated'). Configure the following environment blocks:
+1. 'supabase-db': image 'supabase/postgres:15.1.1.78' mapping loopback port 127.0.0.1:5432:5432.
+2. 'timescaledb': image 'timescale/timescaledb:latest-pg15' mapping loopback port 127.0.0.1:5433:5432.
+3. 'tile-server-martin': image 'maplibre/martin:latest' mapping port 3001, linked directly to the PostGIS metadata container.
+4. 'memgraph-graph': image 'memgraph/memgraph-mage:latest' mapping ports 7687 and 9091.
+5. 'kafka-broker': image 'ubuntu/kafka:latest' configuring a single local KRaft controller node mapping port 9092.
+6. 'kafka-schema-registry': image 'confluentinc/cp-schema-registry:7.5.0' mapping local configuration port 8081.
+7. 'fastapi-sync-service': built via hot-reload configurations, mapping port 5000, mounting local filesystems dynamically.
+8. 'triton-inference': image 'nvcr.io/nvidia/tritonserver:24.01-py3' configured for local CPU execution, mounting local model weight directory tracks.
+
+### MODULE 2: REFINED GHANA CORE POSTGRESQL / POSTGIS DDL (`database/schema.sql`)
+[Data Tier Engineer] Provide a comprehensive SQL initialization script tracking 'giop_core' and 'public' search spaces. All tables must use RFC 4122 UUID primary keys to completely eliminate offline mobile primary-key collisions.
+- Initialize Enums: asset_lifecycle_state, staging_validation_state, ghana_utility_enum (ECG_SOUTHERN, NEDCO_NORTHERN, GRIDCO_TRANSMISSION), ghana_voltage_enum (LV_230V, LV_400V, MV_11KV, MV_33KV, HV_161KV, HV_330KV), and meter_install_status.
+- Provision Master Tables: identified_objects, connectivity_nodes (with Point geometry), conducting_equipment, power_transformers, ac_line_segments (with LineString geometry), customer_accounts, usage_points (with Point geometry), electric_meters, meter_installations, spot_billing_records (with net_consumption generated columns), and field_inspections (holding evidence_photo_url, nameplate_photo_url, and ai_validation_status strings). Include spatial indexing (GIST) across all spatial coordinates.
+- Implement an after-insert trigger on 'spot_billing_records' that automatically adds the computed amount in Ghana Cedis (GHS) onto the customer’s active account balance inside 'customer_accounts'.
+- Implement a BEFORE UPDATE trigger on 'identified_objects' that intercepts incoming data rows from offline devices. If a record has been modified online AFTER the technician's offline session started, flip its status to 'IN_CONFLICT' and write an error trace log instead of applying changes silently.
+- Create an automated dual-pass stored procedure 'repair_asset_topology_and_attributes(target_uuid, radius_meters)'. Pass 1 must evaluate alphanumeric properties via regular expressions (auto-correcting spacing errors like "ECG20001" to "ECG-20001") and balance line voltages based on source node constraints. Pass 2 must calculate geographic proximity offsets using 'ST_Snap' and 'ST_ClosestPoint' to lock loose lines onto connectivity junctions. If updates are made, set validation to 'STAGED'.
+
+### MODULE 3: TIME-SERIES telemetry STORAGE MODEL (`database/timescale.sql`)
+[Data Tier Engineer] Provide the DDL structure for the isolated 'meter_readings' table inside the TimescaleDB instance. Fields must include: id (BIGSERIAL), meter_mrid (UUID), reading_timestamp (TIMESTAMPTZ), and active_energy_kwh (NUMERIC(10,3)). Convert the table into a TimescaleDB Hypertable partitioned cleanly by the reading timeline.
+
+### MODULE 4: CONFLUENT AVRO CONTRACT LOGIC (`config/meter_reading.avsc`)
+[Data Tier Engineer] Output a JSON-formatted Avro schema record named 'MeterIntervalReading' in namespace 'gh.com.giop.m2c'. Establish fields for meter_mrid (logicalType: uuid), reading_timestamp (logicalType: timestamp-millis), active_energy_kwh (float), reactive_energy_kvarh (null or float), and is_estimated (boolean, defaulting to false).
+
+### MODULE 5: FASTAPI SYSTEM REVISING ROUTER ROUTINES (`sync-service/main.py`)
+[Compute & AI Developer] Provide a complete Python 3.11 file initializing an asynchronous web API gateway. It must integrate with graph connection pools and expose the following endpoints:
+1. POST '/webhook/supabase-sync': processes incoming staging table webhooks arrays via background threads, converting structural asset mutations into optimized Cypher operations (MERGE / DETACH DELETE) targeting Memgraph.
+2. POST '/api/v1/topology/repair': accepts an asset UUID, executes the database 'repair_asset_topology_and_attributes' procedure, and logs changes. If geometry alterations are confirmed, trigger an immediate graph re-indexing pass.
+3. POST '/api/v1/m2c/spot-bill-sync': ingests point-of-sale invoices calculated offline by field teams, updates the master customer account ledger, and dispatches validation images to the Triton microservice engine background queue.
+4. GET '/api/v1/trace': accepts an asset UUID, queries Memgraph using recursive pointer-chasing path statements, and returns a JSON trace array grouping distinct lists of nodes and edges ready for frontend visualization.
+
+### MODULE 6: COMPLIANT AVRO PIPELINE INGESTION DAEMON (`sync-service/kafka_avro_consumer.py`)
+[Compute & AI Developer] Provide a background script running a 'DeserializingConsumer' loop. It must subscribe to the topic 'ghana-ami-telemetry-avro', process messages against the Confluent Schema Registry client pool at port 8081, decode the binary byte vectors into structured Python dictionaries, and batch-insert records into the TimescaleDB hypertable using psycopg2 'execute_batch' operations. Include explicit error catch loops to intercept schema evolution discrepancies.
+
+### MODULE 7: BACKOFFICE SINGLE-PAGE OPERATIONAL COMMAND PANEL (`backoffice-ui/`)
+[Frontend & Mobile Systems Engineer] Build a single-page data cleansing dashboard web application utilizing vanilla JavaScript and Tailwind CSS framework elements:
+1. 'theme.js': An exportable Cytoscape.js visual dictionary style sheet mapping assets to strict Single Line Diagram (SLD) grid configurations: 161kV lines must render as Brown (#78350F, width 5), 33kV lines as Blue (#1D4ED8, width 3.5), 11kV lines as Red (#B91C1C, width 2.5), and low-voltage customer drop paths as a Dashed Black Line (#0F172A, width 1.5). Style nodes flagged as 'IN_CONFLICT' with a bold Red boundary outline.
+2. 'index.html': A split-canvas browser dashboard. The top half splits into a left pane rendering geographic asset vectors from the Martin tile server using MapLibre GL, and a right pane displaying an vertical orthogonal network tree using Cytoscape.js and the Dagre engine. The bottom half renders an interactive asset spreadsheet table displaying data rows (color-coding conflict states in Red). The table cells must be editable (supporting inline name edits or drop-down voltage selection), dynamically refreshing the Cytoscape tree above. Include an action bar hosting the 'One-Click Topology Repair' button, and link panels via custom window events so that interacting with an asset row highlights its physical coordinates on the map view.
+
+### MODULE 8: OFFLINE MOBILE PERSISTENCE SPATIAL BASELINE (`mobile/mobile_init.sql`)
+[Frontend & Mobile Systems Engineer] Output a SQL migration script initializing a local mobile database layout within an on-device SQLite + SpatiaLite environment file container.
+- Create tables: field_captured_assets, local_customer_profiles, local_spot_bills (holding previous/current reading floats and local photo cache file paths), and offline_tiles_cache (storing downloaded MapLibre map tile blobs in .pbf format). Add an integer tracking parameter flag ('is_dirty INTEGER DEFAULT 1') to track offline changes.
+- Add an OGC-compliant spatial point column ('geom') to 'field_captured_assets' and compile matching local R-Tree spatial indexes.
+- Include a sample SQL query embedded as a comment showcasing how the mobile application evaluates the ECG Residential Tiered Tariffs locally while offline (e.g., separating Lifeline consumption blocks under 30kWh from standard billing brackets).
+
+Provide the complete set of system files sequentially. Do not truncate the output, and do not use placeholders.

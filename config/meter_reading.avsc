@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "MeterIntervalReading",
+  "namespace": "gh.com.giop.m2c",
+  "fields": [
+    {
+      "name": "meter_mrid",
+      "type": { "type": "string", "logicalType": "uuid" }
+    },
+    {
+      "name": "reading_timestamp",
+      "type": { "type": "long", "logicalType": "timestamp-millis" }
+    },
+    { "name": "active_energy_kwh", "type": "float" },
+    {
+      "name": "reactive_energy_kvarh",
+      "type": ["null", "float"],
+      "default": null
+    },
+    {
+      "name": "is_estimated",
+      "type": "boolean",
+      "default": false
+    }
+  ]
+}
