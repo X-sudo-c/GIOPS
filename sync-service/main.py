@@ -202,6 +202,8 @@ from reference_render import (
     reference_layer_geojson,
 )
 from work_orders import create_work_order, get_work_order, list_work_orders, patch_work_order
+from map_search import SEARCH_KINDS, list_places_index, search_map
+from geocode import geocode_map_places
 from migration_engine import (
     list_failed as list_migration_failed,
     list_runs as list_migration_runs,
@@ -2929,6 +2931,67 @@ async def list_master_assets_bbox(
 
     try:
         return cached_json(cache_key, _fetch)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/map/geocode")
+async def api_map_geocode(
+    q: str = Query(..., min_length=2, max_length=120),
+    limit: int = Query(default=6, ge=1, le=10),
+):
+    """OSM place names (towns, suburbs) not in ECG district boundaries — e.g. Gbawe."""
+    try:
+        return {"query": q, "results": geocode_map_places(q, limit=limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/map/places-index")
+async def api_map_places_index():
+    """District/region centroids and bboxes — fetched once; map search runs client-side."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = "map:places-index:v1"
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return {"places": list_places_index(conn)}
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(cache_key, _fetch, ttl_sec=3600)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/map/search")
+async def api_map_search(
+    q: str = Query(..., min_length=2, max_length=120),
+    limit: int = Query(default=12, ge=1, le=30),
+    kind: str | None = Query(default=None, description="Comma-separated: asset,place,work_order,crew"),
+):
+    """Spotlight search for map navigation — assets, districts, work orders, crews."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    kinds: set[str] | None = None
+    if kind:
+        parsed = {k.strip() for k in kind.split(",") if k.strip()}
+        invalid = parsed - SEARCH_KINDS
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid kind: {', '.join(sorted(invalid))}")
+        kinds = parsed or None
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            results = search_map(conn, query=q, limit=limit, kinds=kinds)
+        finally:
+            conn.close()
+        return {"query": q, "results": results}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

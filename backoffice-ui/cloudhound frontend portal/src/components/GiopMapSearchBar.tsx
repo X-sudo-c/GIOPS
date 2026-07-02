@@ -1,0 +1,287 @@
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
+import { Layers, MapPin, Search, UserRound, Wrench } from 'lucide-react';
+import { getMapGeocode, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
+import {
+  mergeGeocodePlaces,
+  searchLocalMapCatalog,
+  type GiopMapSearchFilter,
+} from '../lib/giopMapLocalSearch';
+
+export type { GiopMapSearchFilter };
+
+interface GiopMapSearchBarProps {
+  isLightMode: boolean;
+  catalog: GiopMapSearchResult[];
+  placesReady?: boolean;
+  onSelect: (result: GiopMapSearchResult) => void;
+  /** Live camera preview while typing (best match). */
+  onPreview: (result: GiopMapSearchResult | null) => void;
+}
+
+const FILTER_OPTIONS: {
+  id: GiopMapSearchFilter;
+  label: string;
+  title: string;
+  icon: typeof Search;
+}[] = [
+  { id: 'all', label: 'All', title: 'Search everything', icon: Search },
+  { id: 'place', label: 'Places', title: 'ECG districts + map towns (OSM)', icon: MapPin },
+  { id: 'asset', label: 'Assets', title: 'Staging assets on map', icon: Layers },
+  { id: 'work_order', label: 'Orders', title: 'Work orders', icon: Wrench },
+  { id: 'crew', label: 'Crews', title: 'Field technicians', icon: UserRound },
+];
+
+function kindLabel(result: GiopMapSearchResult): string {
+  if (result.kind === 'place' && result.id.startsWith('osm:')) {
+    return 'Town';
+  }
+  switch (result.kind) {
+    case 'asset':
+      return 'Asset';
+    case 'place':
+      return 'District';
+    case 'work_order':
+      return 'Work order';
+    case 'crew':
+      return 'Field crew';
+    default:
+      return 'Result';
+  }
+}
+
+export function GiopMapSearchBar({
+  isLightMode,
+  catalog,
+  placesReady = true,
+  onSelect,
+  onPreview,
+}: GiopMapSearchBarProps) {
+  const listboxId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const lastPreviewKeyRef = useRef<string | null>(null);
+  const geocodeSeqRef = useRef(0);
+
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<GiopMapSearchFilter>('place');
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [geocodeHits, setGeocodeHits] = useState<GiopMapSearchResult[]>([]);
+  const [geocoding, setGeocoding] = useState(false);
+
+  const wantsGeocode = filter === 'all' || filter === 'place';
+
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2 || !wantsGeocode) {
+      geocodeSeqRef.current += 1;
+      setGeocodeHits([]);
+      setGeocoding(false);
+      return;
+    }
+
+    setGeocoding(true);
+    const seq = ++geocodeSeqRef.current;
+    const timer = window.setTimeout(() => {
+      void getMapGeocode({ q, limit: 8 })
+        .then((hits) => {
+          if (seq !== geocodeSeqRef.current) return;
+          setGeocodeHits(hits);
+        })
+        .catch(() => {
+          if (seq !== geocodeSeqRef.current) return;
+          setGeocodeHits([]);
+        })
+        .finally(() => {
+          if (seq === geocodeSeqRef.current) setGeocoding(false);
+        });
+    }, 320);
+
+    return () => window.clearTimeout(timer);
+  }, [query, wantsGeocode]);
+
+  const searchCatalog = useMemo(
+    () => mergeGeocodePlaces(catalog, geocodeHits),
+    [catalog, geocodeHits],
+  );
+
+  const results = useMemo(
+    () => searchLocalMapCatalog(searchCatalog, query, filter, 12),
+    [searchCatalog, query, filter],
+  );
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 1) {
+      lastPreviewKeyRef.current = null;
+      onPreview(null);
+      return;
+    }
+
+    const best = searchLocalMapCatalog(searchCatalog, query, filter, 1)[0];
+    if (!best) {
+      lastPreviewKeyRef.current = null;
+      return;
+    }
+
+    const key = `${best.kind}:${best.id}`;
+    if (key === lastPreviewKeyRef.current) return;
+    lastPreviewKeyRef.current = key;
+    onPreview(best);
+  }, [query, filter, searchCatalog, onPreview]);
+
+  useEffect(() => {
+    setActiveIndex(results.length > 0 ? 0 : -1);
+  }, [results]);
+
+  useEffect(() => {
+    const onDocClick = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  const pickResult = useCallback(
+    (result: GiopMapSearchResult) => {
+      onSelect(result);
+      setOpen(false);
+      setQuery(result.title);
+      inputRef.current?.blur();
+    },
+    [onSelect],
+  );
+
+  const onKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        if (!open) setOpen(true);
+        setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setActiveIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (activeIndex >= 0 && results[activeIndex]) {
+          pickResult(results[activeIndex]);
+        } else if (results[0]) {
+          pickResult(results[0]);
+        }
+        return;
+      }
+      if (event.key === 'Escape') {
+        setOpen(false);
+        setQuery('');
+        lastPreviewKeyRef.current = null;
+        onPreview(null);
+        inputRef.current?.blur();
+      }
+    },
+    [activeIndex, open, onPreview, pickResult, results],
+  );
+
+  const showPanel = open && query.trim().length >= 1;
+  const indexing = !placesReady && wantsGeocode;
+  const busy = indexing || geocoding;
+
+  return (
+    <div
+      ref={rootRef}
+      className={`giop-map-spotlight ${isLightMode ? 'giop-map-spotlight--light' : 'giop-map-spotlight--dark'}`}
+      role="search"
+    >
+      <div className="giop-map-spotlight__bar">
+        <Search className="giop-map-spotlight__search-icon" aria-hidden />
+        <input
+          ref={inputRef}
+          type="text"
+          inputMode="search"
+          enterKeyHint="search"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={onKeyDown}
+          placeholder="Search map"
+          className="giop-map-spotlight__input"
+          aria-label="Search map"
+          aria-expanded={showPanel}
+          aria-controls={listboxId}
+          aria-autocomplete="list"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        {busy && <span className="giop-map-spotlight__spinner" aria-hidden />}
+      </div>
+
+      <div className="giop-map-spotlight__filters" role="group" aria-label="Search filters">
+        {FILTER_OPTIONS.map(({ id, title, icon: Icon }) => {
+          const active = filter === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              title={title}
+              aria-label={title}
+              aria-pressed={active}
+              onClick={() => setFilter(id)}
+              className={`giop-map-spotlight__filter-btn${active ? ' giop-map-spotlight__filter-btn--active' : ''}`}
+            >
+              <Icon className="h-4 w-4" aria-hidden />
+            </button>
+          );
+        })}
+      </div>
+
+      {showPanel && (
+        <div className="giop-map-spotlight__panel" id={listboxId} role="listbox">
+          {busy && results.length === 0 && (
+            <p className="giop-map-spotlight__empty">Looking up places…</p>
+          )}
+          {!busy && results.length === 0 && (
+            <p className="giop-map-spotlight__empty">No results for &ldquo;{query.trim()}&rdquo;</p>
+          )}
+          {results.map((result, index) => (
+            <button
+              key={`${result.kind}:${result.id}`}
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              className={`giop-map-spotlight__result${
+                index === activeIndex ? ' giop-map-spotlight__result--active' : ''
+              }`}
+              onMouseEnter={() => {
+                setActiveIndex(index);
+                onPreview(result);
+              }}
+              onClick={() => pickResult(result)}
+            >
+              <span className="giop-map-spotlight__result-kind">{kindLabel(result)}</span>
+              <span className="giop-map-spotlight__result-title">{result.title}</span>
+              {result.subtitle && (
+                <span className="giop-map-spotlight__result-sub">{result.subtitle}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

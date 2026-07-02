@@ -375,6 +375,61 @@ export async function getAssetLocation(mrid: string): Promise<GiopAssetLocation>
   return fetchJson(`${SYNC_BASE}/assets/${encodeURIComponent(mrid)}`);
 }
 
+export type GiopMapSearchKind = 'asset' | 'place' | 'work_order' | 'crew';
+
+export interface GiopMapSearchResult {
+  kind: GiopMapSearchKind;
+  id: string;
+  title: string;
+  subtitle?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  bbox?: {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+  } | null;
+}
+
+export async function searchMap(options: {
+  q: string;
+  limit?: number;
+  kind?: GiopMapSearchKind | GiopMapSearchKind[];
+}): Promise<GiopMapSearchResult[]> {
+  const query = new URLSearchParams();
+  query.set('q', options.q.trim());
+  if (options.limit != null) query.set('limit', String(options.limit));
+  if (options.kind) {
+    const kinds = Array.isArray(options.kind) ? options.kind : [options.kind];
+    query.set('kind', kinds.join(','));
+  }
+  const data = await fetchJson<{ results: GiopMapSearchResult[] }>(
+    `${SYNC_BASE}/map/search?${query}`,
+  );
+  return data.results ?? [];
+}
+
+/** One-time district/region index for client-side map spotlight search. */
+export async function getMapPlacesIndex(): Promise<GiopMapSearchResult[]> {
+  const data = await fetchJson<{ places: GiopMapSearchResult[] }>(`${SYNC_BASE}/map/places-index`);
+  return data.places ?? [];
+}
+
+/** OSM geocoding for towns/suburbs on the basemap (e.g. Gbawe) not in ECG districts. */
+export async function getMapGeocode(options: {
+  q: string;
+  limit?: number;
+}): Promise<GiopMapSearchResult[]> {
+  const query = new URLSearchParams();
+  query.set('q', options.q.trim());
+  if (options.limit != null) query.set('limit', String(options.limit));
+  const data = await fetchJson<{ results: GiopMapSearchResult[] }>(
+    `${SYNC_BASE}/map/geocode?${query}`,
+  );
+  return data.results ?? [];
+}
+
 export async function getStagingAssets(options?: {
   includeRejected?: boolean;
   submittedBy?: string;

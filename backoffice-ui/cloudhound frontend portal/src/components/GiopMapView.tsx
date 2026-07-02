@@ -27,7 +27,7 @@ import {
   fitMapBounds,
   flyToLatLon,
   flyToNodeFocus,
-  panToNodeFocus,
+  GIOP_MAP_LABEL_FONT_BOLD,
 } from '../lib/giopMapLayers';
 import {
   applyReferenceMapConfig,
@@ -46,7 +46,8 @@ import {
   showGiopIdentifyPopup,
 } from '../lib/giopMapIdentify';
 import { attachGiopMapPulseLoop } from '../lib/giopMapPulse';
-import { normalizeMapCoordinates } from '../lib/giopMapCoordinates';
+import { normalizeMapCoordinates, resolveStagingAssetCoordinates, extractStagingGeomCoordinates } from '../lib/giopMapCoordinates';
+import { giopLog } from '../lib/giopDebugLog';
 import { topologyImpactToGeoJson } from '../lib/giopImpactGeoJson';
 import {
   applyTerritoryHighlight,
@@ -60,6 +61,10 @@ import {
 import { GiopMapControlPanel } from './GiopMapControlPanel';
 import { GiopMapLegend } from './GiopMapLegend';
 import { GiopMapFieldPanel } from './GiopMapFieldPanel';
+import { GiopMapSearchBar } from './GiopMapSearchBar';
+import type { GiopMapSearchResult } from '../api/giop-api';
+import { useGiopMapSearchCatalog } from '../hooks/useGiopMapSearchCatalog';
+import { mapSearchEase } from '../lib/giopMapLocalSearch';
 import { GiopTerritoryMapToggle, GiopTerritoryProvider } from '../context/GiopTerritoryContext';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 
@@ -95,6 +100,12 @@ interface GiopMapViewProps {
   impactOverlay?: GiopTopologyPayload | null;
   /** Pulsing ripple on the focused node (side-map identify only). */
   pulseFocus?: boolean;
+  /** Full map chrome (overlays, legend, crews) vs minimal steward desk map. */
+  mapChrome?: 'full' | 'operations';
+  /** Apple-style spotlight search at top-center (default: on except ops desk). */
+  showSearchBar?: boolean;
+  /** Imperative camera pan request (ops desk "View on map"); flies whenever `id` changes. */
+  flyRequest?: { id: number; coordinates: [number, number] | null } | null;
 }
 
 const DEFAULT_CENTER: [number, number] = [-0.2941, 5.6812];
@@ -131,7 +142,7 @@ function safeMapMutate(map: maplibregl.Map, fn: () => void): void {
   try {
     fn();
   } catch (err) {
-    console.warn('[GiopMap] layer mutation skipped:', err);
+    giopLog.map.warn('layer mutation skipped', err);
   }
 }
 
@@ -154,20 +165,86 @@ function whenMapCanAddLayers(map: maplibregl.Map, fn: () => void): () => void {
     try {
       fn();
     } catch (err) {
-      console.warn('[GiopMap] layer mutation failed:', err);
+      giopLog.map.warn('layer mutation failed', err);
     }
   };
-  if (map.isStyleLoaded()) {
+  if (mapHasStyle(map)) {
     run();
   } else {
     map.once('load', run);
     map.once('styledata', () => {
-      if (map.isStyleLoaded()) run();
+      if (mapHasStyle(map)) run();
     });
   }
   return () => {
     cancelled = true;
   };
+}
+
+/** Defer layer/source work until the camera is idle — avoids stuck drags from mid-pan mutations. */
+function whenMapIdle(map: maplibregl.Map, fn: () => void): () => void {
+  let cancelled = false;
+  const run = () => {
+    if (cancelled) return;
+    if (map.isMoving()) {
+      map.once('idle', run);
+      return;
+    }
+    fn();
+  };
+  run();
+  return () => {
+    cancelled = true;
+  };
+}
+
+function scheduleMapLayerWork(map: maplibregl.Map, fn: () => void): () => void {
+  let cancelled = false;
+  let cancelInner = () => {};
+
+  const start = () => {
+    if (cancelled) return;
+    cancelInner = whenMapIdle(map, () => {
+      if (cancelled) return;
+      cancelInner = whenMapCanAddLayers(map, fn);
+    });
+  };
+
+  start();
+  return () => {
+    cancelled = true;
+    cancelInner();
+  };
+}
+
+const FOCUS_IDENTIFY_LAYER_IDS = [
+  'focus-identify-pulse',
+  'focus-identify-pulse-2',
+  'focus-identify-point',
+  'focus-identify-label',
+] as const;
+
+const FIELD_TECHNICIAN_LAYER_IDS = [
+  'field-technician-halo',
+  'field-technician-points',
+] as const;
+
+/** Keep field crew markers above tile/staging overlays. */
+function pinFieldTechnicianLayersToTop(map: maplibregl.Map): void {
+  safeMapMutate(map, () => {
+    for (const id of FIELD_TECHNICIAN_LAYER_IDS) {
+      if (map.getLayer(id)) map.moveLayer(id);
+    }
+  });
+}
+
+/** Keep the focused asset label above staging/tile overlays after pan or layer refresh. */
+function pinFocusIdentifyLayersToTop(map: maplibregl.Map): void {
+  safeMapMutate(map, () => {
+    for (const id of FOCUS_IDENTIFY_LAYER_IDS) {
+      if (map.getLayer(id)) map.moveLayer(id);
+    }
+  });
 }
 
 function applyMapTheme(map: maplibregl.Map, isLightMode: boolean) {
@@ -212,7 +289,12 @@ export function GiopMapView({
   workOrders = [],
   impactOverlay = null,
   pulseFocus = false,
+  mapChrome = 'full',
+  showSearchBar: showSearchBarProp,
+  flyRequest = null,
 }: GiopMapViewProps) {
+  const isOpsMap = mapChrome === 'operations';
+  const showSearchBar = showSearchBarProp ?? !isOpsMap;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const onNodeClickRef = useRef(onNodeClick);
@@ -221,6 +303,7 @@ export function GiopMapView({
   const onTerritorySelectRef = useRef(onTerritorySelect);
   const isLightModeRef = useRef(isLightMode);
   const [mapBusy, setMapBusy] = useState(true);
+  const [mapReady, setMapReady] = useState(false);
   const [mapZoom, setMapZoom] = useState(11);
   const [gisOverviewAvailable, setGisOverviewAvailable] = useState<boolean | null>(() =>
     cachedGisOverviewAvailable !== undefined ? cachedGisOverviewAvailable : null,
@@ -238,12 +321,22 @@ export function GiopMapView({
   const territoryActiveRef = useRef(false);
   const handledCameraRequestIdRef = useRef(0);
   const handledViewportCommandIdRef = useRef(0);
-  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight } =
+  const stagingAssetsRef = useRef(stagingAssets);
+  const chunkRef = useRef(graphChunkExternal);
+  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, focusOnMap, queueMapViewportCommand } =
     useGiopMapOverlay();
+
+  const { catalog: searchCatalog, placesReady } = useGiopMapSearchCatalog({
+    workOrders,
+    fieldTechnicians,
+    stagingAssets,
+  });
 
   const { chunk: internalChunk, loadBbox } = useGiopGraphChunk(startMrid);
 
   const chunk = streamGraphChunk ? internalChunk : graphChunkExternal;
+  stagingAssetsRef.current = stagingAssets;
+  chunkRef.current = chunk;
 
   territoryActiveRef.current = territoryActive;
   boundaryVisibilityRef.current = boundaryVisibility;
@@ -358,7 +451,7 @@ export function GiopMapView({
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     mapRef.current = map;
 
-    const syncMapState = () => {
+    const syncMapZoom = () => {
       setMapZoom(Number(map.getZoom().toFixed(1)));
     };
     const revealZoomHint = () => {
@@ -370,21 +463,29 @@ export function GiopMapView({
       hideZoomHintTimerRef.current = window.setTimeout(() => setZoomHintVisible(false), delay);
     };
     const markMapReady = () => {
-      syncMapState();
+      syncMapZoom();
       setMapBusy(false);
+      setMapReady(true);
+    };
+    const syncMovingState = () => {
+      setMapBusy(map.isMoving());
     };
 
-    map.on('movestart', () => setMapBusy(true));
+    map.on('movestart', syncMovingState);
+    map.on('moveend', () => {
+      syncMovingState();
+      syncMapZoom();
+    });
     map.on('zoomstart', () => {
-      setMapBusy(true);
+      syncMovingState();
       revealZoomHint();
     });
-    map.on('zoom', syncMapState);
-    map.on('moveend', () => setMapBusy(false));
     map.on('zoomend', () => {
-      markMapReady();
+      syncMovingState();
+      syncMapZoom();
       scheduleHideZoomHint();
     });
+    map.on('idle', markMapReady);
 
     const handleNodeFeatureClickInit = (
       feature: maplibregl.MapGeoJSONFeature | undefined,
@@ -420,18 +521,24 @@ export function GiopMapView({
     let detachPulse: (() => void) | undefined;
 
     map.once('load', () => {
-      registerGiopMapIcons(map, isLightModeRef.current);
-      bindMartinClicks();
-      detachHover = attachGiopMapHover(map, host, () => isLightModeRef.current);
-      detachPulse = attachGiopMapPulseLoop(map);
-      resizeMap();
+      // Mark ready first so map setup failures (e.g. Martin tiles unavailable) never
+      // leave the map in a permanently "not ready" state that blocks camera flys.
+      try {
+        registerGiopMapIcons(map, isLightModeRef.current);
+        bindMartinClicks();
+        detachHover = attachGiopMapHover(map, host, () => isLightModeRef.current);
+        detachPulse = attachGiopMapPulseLoop(map);
+        resizeMap();
+      } catch (err) {
+        giopLog.map.warn('map load setup failed', err);
+      }
       markMapReady();
       revealZoomHint();
       scheduleHideZoomHint(ZOOM_HINT_INITIAL_MS);
     });
 
     map.on('error', (event) => {
-      console.warn('[GiopMap] MapLibre error:', event.error?.message ?? event);
+      giopLog.map.error('MapLibre error', event.error?.message ?? event);
     });
 
     return () => {
@@ -441,6 +548,7 @@ export function GiopMapView({
       resizeObserver?.disconnect();
       map.remove();
       mapRef.current = null;
+      setMapReady(false);
     };
   }, [gisOverviewAvailable]);
 
@@ -539,7 +647,7 @@ export function GiopMapView({
           applyAllBoundaryVisibility(map, boundaryVisibilityRef.current, referenceMapConfig);
         })
         .catch((err) => {
-          console.warn('[GiopMap] reference layer apply failed:', err);
+          giopLog.map.warn('reference layer apply failed', err);
         });
     };
 
@@ -577,7 +685,7 @@ export function GiopMapView({
           },
           isLightModeRef.current,
         ).catch((err) => {
-          console.warn('[GiopMap] reference bbox refresh failed:', err);
+          giopLog.map.warn('reference bbox refresh failed', err);
         });
       }, 300);
     };
@@ -654,12 +762,8 @@ export function GiopMapView({
       }
     };
 
-    if (map.isStyleLoaded()) {
-      applyChunkLayers();
-    } else {
-      whenMapCanAddLayers(map, applyChunkLayers);
-    }
-  }, [chunk, mapZoom]);
+    return scheduleMapLayerWork(map, applyChunkLayers);
+  }, [chunk]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -667,20 +771,24 @@ export function GiopMapView({
 
     const geojson = {
       type: 'FeatureCollection' as const,
-      features: stagingAssets
-        .filter((a) => a.geom?.coordinates)
-        .map((a) => ({
-          type: 'Feature' as const,
-          properties: {
-            mrid: a.mrid,
-            name: a.name || a.mrid,
-            validation: a.validation ?? 'PENDING_FIELD',
+      features: stagingAssets.flatMap((a) => {
+        const coordinates = extractStagingGeomCoordinates(a.geom);
+        if (!coordinates) return [];
+        return [
+          {
+            type: 'Feature' as const,
+            properties: {
+              mrid: a.mrid,
+              name: a.name || a.mrid,
+              validation: a.validation ?? 'PENDING_FIELD',
+            },
+            geometry: {
+              type: 'Point' as const,
+              coordinates,
+            },
           },
-          geometry: {
-            type: 'Point' as const,
-            coordinates: a.geom!.coordinates,
-          },
-        })),
+        ];
+      }),
     };
 
     const sourceId = 'staging-overlay';
@@ -736,9 +844,10 @@ export function GiopMapView({
       }
 
       applyStagingMapLayersPaint(map);
+      pinFocusIdentifyLayersToTop(map);
     };
 
-    if (map.isStyleLoaded()) {
+    if (mapHasStyle(map)) {
       ensureStagingLayers();
     } else {
       whenMapCanAddLayers(map, ensureStagingLayers);
@@ -747,7 +856,7 @@ export function GiopMapView({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
+    if (!map) return undefined;
 
     const geojson = {
       type: 'FeatureCollection' as const,
@@ -764,53 +873,66 @@ export function GiopMapView({
       })),
     };
 
-    const sourceId = 'field-technicians';
-    if (map.getSource(sourceId)) {
-      (map.getSource(sourceId) as maplibregl.GeoJSONSource).setData(geojson);
-    } else {
-      map.addSource(sourceId, { type: 'geojson', data: geojson });
-      map.addLayer({
-        id: 'field-technician-halo',
-        type: 'circle',
-        source: sourceId,
-        paint: {
-          'circle-radius': 20,
-          'circle-color': '#22d3ee',
-          'circle-opacity': 0.15,
-          'circle-stroke-width': 0,
-        },
-      });
-      map.addLayer({
-        id: 'field-technician-points',
-        type: 'circle',
-        source: sourceId,
-        paint: {
-          'circle-radius': 12,
-          'circle-color': '#22d3ee',
-          'circle-stroke-width': 3,
-          'circle-stroke-color': '#0e7490',
-        },
-      });
-      map.on('click', 'field-technician-points', (e) => {
-        const f = e.features?.[0];
-        if (f) showAssetIdentify(map, e.lngLat, f, 'field-technician-points');
-        const id = f?.properties?.technician_id as string | undefined;
-        if (id && onTechnicianClickRef.current) onTechnicianClickRef.current(id);
-      });
-    }
+    const applyFieldTechnicians = () => {
+      const sourceId = 'field-technicians';
+      if (map.getSource(sourceId)) {
+        (map.getSource(sourceId) as maplibregl.GeoJSONSource).setData(geojson);
+      } else {
+        map.addSource(sourceId, { type: 'geojson', data: geojson });
+        map.addLayer({
+          id: 'field-technician-halo',
+          type: 'circle',
+          source: sourceId,
+          paint: {
+            'circle-radius': 20,
+            'circle-color': '#22d3ee',
+            'circle-opacity': 0.15,
+            'circle-stroke-width': 0,
+          },
+        });
+        map.addLayer({
+          id: 'field-technician-points',
+          type: 'circle',
+          source: sourceId,
+          paint: {
+            'circle-radius': 12,
+            'circle-color': '#22d3ee',
+            'circle-stroke-width': 3,
+            'circle-stroke-color': '#0e7490',
+          },
+        });
+        map.on('click', 'field-technician-points', (e) => {
+          const f = e.features?.[0];
+          if (f) showAssetIdentify(map, e.lngLat, f, 'field-technician-points');
+          const id = f?.properties?.technician_id as string | undefined;
+          if (id && onTechnicianClickRef.current) onTechnicianClickRef.current(id);
+        });
+      }
+      pinFieldTechnicianLayersToTop(map);
+    };
+
+    return scheduleMapLayerWork(map, applyFieldTechnicians);
   }, [fieldTechnicians]);
 
-  // Camera moves only on explicit focusOnMap requests — not selection/staging churn.
+  // Camera fly on explicit focus requests (Audit side panel, Map tab).
   useEffect(() => {
-    if (territoryActive || !focusMrid) return;
-    if (gisOverviewAvailable === null || mapBusy) return;
+    if (isOpsMap) return;
+    if (territoryActive) return;
+    if (gisOverviewAvailable === null) return;
+    if (mapBusy || !focusMrid) return;
 
     const req = focusCameraRequest;
-    if (!req || req.mrid !== focusMrid) return;
+    if (!req) return;
     if (req.id <= handledCameraRequestIdRef.current) return;
+    if (req.mrid !== focusMrid) return;
 
     const coords =
-      normalizeMapCoordinates(req.coordinates) ?? normalizeMapCoordinates(focusCoordinates);
+      normalizeMapCoordinates(req.coordinates) ??
+      resolveStagingAssetCoordinates(req.mrid, {
+        coordinates: focusCoordinates ?? null,
+        stagingAssets: stagingAssetsRef.current,
+        chunkNodes: chunkRef.current?.nodes,
+      });
     if (!coords) return;
 
     const map = mapRef.current;
@@ -818,24 +940,19 @@ export function GiopMapView({
 
     const performFly = () => {
       try {
+        map.resize();
         if (req.boostZoom) {
           flyToNodeFocus(map, coords, 800, { boostZoom: true });
         } else {
-          panToNodeFocus(map, coords);
+          map.easeTo({ center: coords, duration: 400 });
         }
         handledCameraRequestIdRef.current = req.id;
-        // Clear the consumed request so a later remount (e.g. re-entering the
-        // Map tab) does not re-fly to this node — the Map tab must stay free.
         clearFocusCamera();
       } catch (err) {
-        console.warn('[GiopMap] focus camera failed:', err);
+        giopLog.map.error('focus camera failed', err);
       }
     };
 
-    // On a freshly mounted map (e.g. side-panel remount per mrid) the style
-    // is not loaded yet and MapLibre silently drops flyTo. Wait for 'load'
-    // before moving the camera, and only mark the request handled once the
-    // move actually runs so a later coords/map update can still retry.
     if (map.isStyleLoaded()) {
       performFly();
       return;
@@ -847,6 +964,7 @@ export function GiopMapView({
       map.off('load', onLoad);
     };
   }, [
+    isOpsMap,
     focusCameraRequest,
     focusMrid,
     focusCoordinates,
@@ -854,19 +972,59 @@ export function GiopMapView({
     clearFocusCamera,
     gisOverviewAvailable,
     mapBusy,
+    mapReady,
   ]);
+
+  // Operations desk "View on map": gate-free imperative pan. Flies whenever the request
+  // id changes, with NO dependency on mapReady / gisOverviewAvailable / camera dedup.
+  // Coordinates come straight from the clicked row, so this is the most reliable path.
+  useEffect(() => {
+    const req = flyRequest;
+    if (!req) return;
+    giopLog.map.info('flyRequest received', { id: req.id, coordinates: req.coordinates });
+    const coords = normalizeMapCoordinates(req.coordinates);
+    if (!coords) {
+      giopLog.map.warn('flyRequest has no usable coordinates', req);
+      return;
+    }
+    const map = mapRef.current;
+    if (!map) {
+      giopLog.map.warn('flyRequest received before map was created');
+      return;
+    }
+
+    // flyTo only manipulates the camera, so it does NOT require the style/tiles to be
+    // loaded. We call it directly: relying on the one-shot 'load' event here is a bug
+    // because it already fired at startup and never fires again for an in-place map.
+    try {
+      map.resize();
+      flyToNodeFocus(map, coords, 800, { boostZoom: true });
+      giopLog.map.info('flyRequest pan issued', coords);
+      const onMoveEnd = () => {
+        pinFocusIdentifyLayersToTop(map);
+        map.off('moveend', onMoveEnd);
+      };
+      map.on('moveend', onMoveEnd);
+    } catch (err) {
+      giopLog.map.error('flyRequest pan failed', err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flyRequest?.id]);
 
   useEffect(() => {
     const cmd = mapViewportCommand;
     if (!cmd) return;
     if (cmd.id <= handledViewportCommandIdRef.current) return;
-    if (gisOverviewAvailable === null || mapBusy) return;
+    if (gisOverviewAvailable === null) return;
+    if (!mapReady) return;
+    if (mapBusy && !isOpsMap) return;
 
     const map = mapRef.current;
     if (!map) return;
 
     const perform = () => {
       try {
+        map.resize();
         if (cmd.type === 'fit_bounds' && cmd.bbox) {
           fitMapBounds(map, cmd.bbox);
         } else if (cmd.type === 'fly_to' && cmd.center) {
@@ -875,7 +1033,7 @@ export function GiopMapView({
         handledViewportCommandIdRef.current = cmd.id;
         clearMapViewportCommand();
       } catch (err) {
-        console.warn('[GiopMap] viewport command failed:', err);
+        giopLog.map.error('viewport command failed', err);
       }
     };
 
@@ -884,7 +1042,7 @@ export function GiopMapView({
       return;
     }
     map.once('load', perform);
-  }, [mapViewportCommand, clearMapViewportCommand, gisOverviewAvailable, mapBusy]);
+  }, [mapViewportCommand, clearMapViewportCommand, gisOverviewAvailable, mapBusy, isOpsMap, mapReady]);
 
   // Work-order dispatch pins (FR-012 map overlay).
   useEffect(() => {
@@ -988,7 +1146,7 @@ export function GiopMapView({
     try {
       ({ nodes, edges } = topologyImpactToGeoJson(impactOverlay));
     } catch (err) {
-      console.warn('[GiopMap] impact overlay parse failed:', err);
+      giopLog.map.warn('impact overlay parse failed', err);
       return;
     }
     const nodeSourceId = 'impact-nodes';
@@ -1072,10 +1230,77 @@ export function GiopMapView({
     }
   }, [impactOverlay, mapBusy]);
 
-  // Side-map identify: pulse the focused asset so stewards can spot it on the map.
+  // FR-005 topology repair preview (before/after segment snap).
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || gisOverviewAvailable === null || mapBusy) {
+    if (!map || mapBusy) return;
+
+    const beforeSourceId = 'repair-preview-before';
+    const afterSourceId = 'repair-preview-after';
+    const before = repairPreviewLayers?.before ?? EMPTY_FC;
+    const after = repairPreviewLayers?.after ?? EMPTY_FC;
+    const hasPreview = before.features.length > 0 || after.features.length > 0;
+
+    const applyRepairPreview = () => {
+      if (!hasPreview) {
+        safeRemoveLayer(map, 'repair-preview-after-layer');
+        safeRemoveLayer(map, 'repair-preview-before-layer');
+        safeRemoveSource(map, afterSourceId);
+        safeRemoveSource(map, beforeSourceId);
+        return;
+      }
+
+      if (map.getSource(beforeSourceId)) {
+        (map.getSource(beforeSourceId) as maplibregl.GeoJSONSource).setData(before);
+      } else if (before.features.length > 0) {
+        map.addSource(beforeSourceId, { type: 'geojson', data: before });
+      }
+
+      if (before.features.length > 0 && map.getSource(beforeSourceId) && !map.getLayer('repair-preview-before-layer')) {
+        map.addLayer({
+          id: 'repair-preview-before-layer',
+          type: 'line',
+          source: beforeSourceId,
+          paint: {
+            'line-color': '#f59e0b',
+            'line-width': 3,
+            'line-opacity': 0.9,
+            'line-dasharray': [2, 2],
+          },
+        });
+      }
+
+      if (map.getSource(afterSourceId)) {
+        (map.getSource(afterSourceId) as maplibregl.GeoJSONSource).setData(after);
+      } else if (after.features.length > 0) {
+        map.addSource(afterSourceId, { type: 'geojson', data: after });
+      }
+
+      if (after.features.length > 0 && map.getSource(afterSourceId) && !map.getLayer('repair-preview-after-layer')) {
+        map.addLayer({
+          id: 'repair-preview-after-layer',
+          type: 'line',
+          source: afterSourceId,
+          paint: {
+            'line-color': '#22c55e',
+            'line-width': 3.5,
+            'line-opacity': 0.95,
+          },
+        });
+      }
+    };
+
+    if (map.isStyleLoaded()) {
+      applyRepairPreview();
+    } else {
+      whenMapCanAddLayers(map, applyRepairPreview);
+    }
+  }, [repairPreviewLayers, mapBusy]);
+
+  // Focused asset label + pulse — keep visible while focused; do not rebuild on every pan/zoom.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || gisOverviewAvailable === null) {
       return () => {};
     }
 
@@ -1102,7 +1327,7 @@ export function GiopMapView({
 
     let cancelled = false;
     const labelText =
-      (focusLabel && focusLabel.trim()) || `${focusMrid.slice(0, 8)}…`;
+      (focusLabel && focusLabel.trim()) || 'Unnamed asset';
 
     const applyWithCoords = (coordinates: [number, number]) => {
       if (cancelled) return;
@@ -1135,6 +1360,12 @@ export function GiopMapView({
       const apply = () => {
         if (cancelled || !mapHasStyle(map)) return;
         safeMapMutate(map, () => {
+          const existing = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+          if (existing) {
+            existing.setData(geojson);
+            return;
+          }
+
           for (const id of layerIds) {
             if (map.getLayer(id)) map.removeLayer(id);
           }
@@ -1167,7 +1398,7 @@ export function GiopMapView({
               'text-size': ['interpolate', ['linear'], ['zoom'], 13, 11, 17, 14, 18, 15],
               'text-offset': [0, -1.8],
               'text-anchor': 'bottom',
-              'text-font': ['Noto Sans Bold'],
+              'text-font': GIOP_MAP_LABEL_FONT_BOLD,
               'text-allow-overlap': true,
               'text-ignore-placement': true,
             },
@@ -1177,15 +1408,21 @@ export function GiopMapView({
               'text-halo-width': 2.5,
             },
           });
+          pinFocusIdentifyLayersToTop(map);
         });
       };
 
       cancelPendingApply?.();
-      if (map.isStyleLoaded()) apply();
+      if (mapHasStyle(map)) apply();
       else cancelPendingApply = whenMapCanAddLayers(map, apply);
     };
 
-    const resolved = normalizeMapCoordinates(focusCoordinates);
+    const resolved =
+      resolveStagingAssetCoordinates(focusMrid, {
+        coordinates: focusCoordinates ?? null,
+        stagingAssets: stagingAssetsRef.current,
+        chunkNodes: chunkRef.current?.nodes,
+      });
     if (resolved) {
       applyWithCoords(resolved);
       return () => {
@@ -1210,7 +1447,7 @@ export function GiopMapView({
       cancelPendingApply?.();
       teardown();
     };
-  }, [pulseFocus, focusMrid, focusCoordinates, focusLabel, gisOverviewAvailable, mapBusy]);
+  }, [pulseFocus, focusMrid, focusCoordinates, focusLabel, gisOverviewAvailable, flyRequest?.id]);
 
   // De-emphasise neighbouring poles while side-map identify is active.
   useEffect(() => {
@@ -1442,6 +1679,113 @@ export function GiopMapView({
     };
   }, [anyBoundaryVisible, boundaryVisibility, referenceMapConfig]);
 
+  const handleSearchPreview = useCallback((result: GiopMapSearchResult | null) => {
+    const map = mapRef.current;
+    if (!map || !result) return;
+
+    const duration = 1100;
+    if (
+      result.kind === 'place' &&
+      result.bbox?.west != null &&
+      result.bbox?.south != null &&
+      result.bbox?.east != null &&
+      result.bbox?.north != null
+    ) {
+      map.fitBounds(
+        [
+          [result.bbox.west, result.bbox.south],
+          [result.bbox.east, result.bbox.north],
+        ],
+        { padding: 56, duration, maxZoom: 13, easing: mapSearchEase },
+      );
+      return;
+    }
+
+    if (result.longitude != null && result.latitude != null) {
+      const zoom =
+        result.kind === 'place'
+          ? Math.max(map.getZoom(), 11)
+          : Math.max(map.getZoom(), 14);
+      map.easeTo({
+        center: [result.longitude, result.latitude],
+        zoom,
+        duration,
+        easing: mapSearchEase,
+      });
+    }
+  }, []);
+
+  const handleSearchSelect = useCallback(
+    (result: GiopMapSearchResult) => {
+      const coords =
+        result.longitude != null && result.latitude != null
+          ? ([result.longitude, result.latitude] as [number, number])
+          : null;
+
+      if (result.kind === 'asset') {
+        void focusOnMap(result.id, {
+          name: result.title,
+          coordinates: coords,
+          sidePanel: false,
+          navigateTab: false,
+          source: 'map',
+        });
+        onNodeClickRef.current?.(result.id, coords ?? undefined);
+        return;
+      }
+
+      if (result.kind === 'place') {
+        if (
+          result.bbox?.west != null &&
+          result.bbox?.south != null &&
+          result.bbox?.east != null &&
+          result.bbox?.north != null
+        ) {
+          queueMapViewportCommand({
+            type: 'fit_bounds',
+            bbox: {
+              west: result.bbox.west,
+              south: result.bbox.south,
+              east: result.bbox.east,
+              north: result.bbox.north,
+            },
+          });
+        } else if (coords) {
+          queueMapViewportCommand({
+            type: 'fly_to',
+            center: { lon: coords[0], lat: coords[1] },
+            zoom: 12,
+          });
+        }
+        onTerritorySelectRef.current?.({
+          district: result.title,
+          region: result.subtitle ?? undefined,
+        });
+        return;
+      }
+
+      if (coords) {
+        const map = mapRef.current;
+        if (map) {
+          flyToNodeFocus(map, coords, 800, {
+            boostZoom: result.kind === 'work_order',
+          });
+        } else {
+          queueMapViewportCommand({
+            type: 'fly_to',
+            center: { lon: coords[0], lat: coords[1] },
+            zoom: result.kind === 'work_order' ? 15 : 14,
+          });
+        }
+      }
+
+      if (result.kind === 'crew') {
+        onTechnicianClickRef.current?.(result.id);
+      }
+    },
+    [focusOnMap, queueMapViewportCommand],
+  );
+
   return (
     <GiopTerritoryProvider
       mapRef={mapRef}
@@ -1453,6 +1797,15 @@ export function GiopMapView({
     >
       <div className="giop-map-host">
         <div ref={containerRef} className="absolute inset-0" />
+        {showSearchBar && (
+          <GiopMapSearchBar
+            isLightMode={isLightMode}
+            catalog={searchCatalog}
+            placesReady={placesReady}
+            onPreview={handleSearchPreview}
+            onSelect={handleSearchSelect}
+          />
+        )}
         <div className="pointer-events-none absolute top-3 right-16 z-10 flex items-start gap-2 flex-row-reverse">
           {fieldCrews && (
             <div className="pointer-events-auto shrink-0">
@@ -1471,6 +1824,7 @@ export function GiopMapView({
               />
             </div>
           )}
+          {!isOpsMap && (
           <div
             className={`giop-map-zoom-hint shrink-0 rounded-md border px-3 py-2 text-xs shadow-lg ${
               zoomHintVisible ? 'giop-map-zoom-hint--visible' : ''
@@ -1483,7 +1837,9 @@ export function GiopMapView({
           >
             Zoom {mapZoom.toFixed(1)}
           </div>
+          )}
         </div>
+        {!isOpsMap && (
         <GiopMapControlPanel
           isLightMode={isLightMode}
           groups={[
@@ -1524,6 +1880,8 @@ export function GiopMapView({
           ]}
           footerSlot={<GiopTerritoryMapToggle inline />}
         />
+        )}
+        {!isOpsMap && (
         <GiopMapLegend
           isLightMode={isLightMode}
           mapRef={mapRef}
@@ -1531,6 +1889,7 @@ export function GiopMapView({
           mapReady={!mapBusy && gisOverviewAvailable !== null}
           includeGisOverview={gisOverviewAvailable === true}
         />
+        )}
       </div>
     </GiopTerritoryProvider>
   );

@@ -73,6 +73,7 @@ export function GiopSideMapPanel({
           focusCoordinates={coordinates}
           focusLabel={name}
           pulseFocus={Boolean(mrid)}
+          showSearchBar={false}
           stagingAssets={stagingAssets}
           refreshToken={mapRefreshToken}
           startMrid={startMrid}
